@@ -16,7 +16,7 @@ DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
 CKPT_DIR = ROOT / "checkpoints" / "tiny_baseline"
 IMG_SIZE = (64, 64)          # Tiny ImageNet images are 64x64
 BATCH = 64
-EPOCHS = 3                   # set to 1 for smoke test
+EPOCHS = 1                  # set to 1 for smoke test
 SEED = 42
 AUTOTUNE = tf.data.AUTOTUNE
 
