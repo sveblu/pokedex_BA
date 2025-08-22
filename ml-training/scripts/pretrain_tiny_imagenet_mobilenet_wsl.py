@@ -19,12 +19,12 @@ EPOCHS_HEAD = 3
 EPOCHS_FT = 10
 SEED = 42
 AUTOTUNE = tf.data.AUTOTUNE
-OVERFIT_TEST = True   # set True to debug on 5 classes; False for full run
+OVERFIT_TEST = True   # True = 5-class sanity run; False = full 200 classes
 
 random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Optional mixed precision (helps on RTX)
+# Optional mixed precision (good on RTX)
 try:
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
 except Exception:
@@ -52,7 +52,7 @@ def _decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)        # keep [0..255]; preprocess_input will scale
+    img = tf.cast(img, tf.float32)        # [0..255]; preprocess_input will scale
     if train:
         img = tf.image.random_flip_left_right(img)
         img = tf.image.random_brightness(img, 0.2)
@@ -75,7 +75,7 @@ def make_datasets():
         batch_size=BATCH,
         shuffle=True,
         seed=SEED,
-        class_names=wnids,   # <-- correct arg name; forces our wnids order
+        class_names=wnids,          # <- force exact order (matches val)
     ).prefetch(AUTOTUNE)
 
     # VAL — from annotations mapped to wnids order
@@ -108,7 +108,8 @@ def build_mobilenet_v2(num_classes: int):
     )
     inp = layers.Input(shape=(*IMG_SIZE, 3))
     x = keras.applications.mobilenet_v2.preprocess_input(inp)  # scales to [-1,1]
-    x = base(x, training=True)
+    # IMPORTANT: don't force training=True here; let Keras control BN behavior
+    x = base(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.2)(x)
     out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
@@ -133,7 +134,7 @@ def main():
     )
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_HEAD, verbose=2)
 
-    # 2) Fine-tune
+    # 2) Fine-tune: unfreeze last 70% of layers
     for i, layer in enumerate(base.layers):
         layer.trainable = (i >= int(len(base.layers) * 0.7))
 
