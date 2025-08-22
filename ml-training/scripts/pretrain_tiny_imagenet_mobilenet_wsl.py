@@ -1,179 +1,128 @@
-import os, csv, json, pathlib, random
+import os, csv, pathlib, random
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-# ----------------------------
-# Config
-# ----------------------------
-ROOT = pathlib.Path(__file__).resolve().parents[1]  # -> ml-training/
+# --------- config ---------
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
-
-CKPT_DIR     = ROOT / "checkpoints" / "tiny_mobilenetv2"
-BACKBONE_DIR = ROOT / "checkpoints" / "backbone_tiny_mnv2"
-LOG_DIR      = ROOT / "checkpoints" / "tblogs"
-
 IMG_SIZE = (224, 224)
 BATCH = 32
-EPOCHS_HEAD = 0
-EPOCHS_FT = 15
+EPOCHS = 25
 SEED = 42
+CLASSES = 5
+TRAIN_PER_CLASS = 200   # from train/
+VAL_PER_CLASS   = 100   # from val/
 AUTOTUNE = tf.data.AUTOTUNE
-OVERFIT_TEST = True   # True = 5-class sanity run; False = full 200 classes
 
 random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Optional mixed precision (good on RTX)
-try:
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-except Exception:
-    pass
+# IMPORTANT: keep everything in float32 for this debug
+# tf.keras.mixed_precision.set_global_policy("float32")
 
-for p in (CKPT_DIR, BACKBONE_DIR, LOG_DIR):
-    p.mkdir(parents=True, exist_ok=True)
+def read_wnids():
+    wnids = (DATA_DIR / "wnids.txt").read_text().strip().splitlines()
+    return wnids[:CLASSES]  # first 5 consistently
 
-# ----------------------------
-# Data
-# ----------------------------
-def _load_val_annotations(val_dir: pathlib.Path, wnid_to_id):
-    files, labels = [], []
-    with (val_dir / "val_annotations.txt").open("r") as f:
-        r = csv.reader(f, delimiter="\t")
-        for row in r:
-            fname, wnid = row[0], row[1]
-            p = val_dir / "images" / fname
-            if p.exists() and wnid in wnid_to_id:
-                files.append(str(p))
-                labels.append(wnid_to_id[wnid])
-    return files, labels
+def gather_train_files(wnids):
+    paths, labels = [], []
+    for cid, wnid in enumerate(wnids):
+        img_dir = DATA_DIR / "train" / wnid / "images"
+        imgs = sorted([*img_dir.glob("*.JPEG"), *img_dir.glob("*.jpg")])
+        imgs = imgs[:TRAIN_PER_CLASS]
+        paths += [str(p) for p in imgs]
+        labels += [cid] * len(imgs)
+    return paths, labels
 
-def _decode(path, label, train=False):
+def gather_val_files(wnids):
+    # Map val images via val_annotations.txt to our 5 wnids
+    ann = (DATA_DIR / "val" / "val_annotations.txt").read_text().splitlines()
+    wnid_to_id = {w: i for i, w in enumerate(wnids)}
+    images_dir = DATA_DIR / "val" / "images"
+    per_class = {i: [] for i in range(len(wnids))}
+    for line in ann:
+        parts = line.split("\t")
+        fname, wnid = parts[0], parts[1]
+        if wnid in wnid_to_id:
+            cid = wnid_to_id[wnid]
+            p = images_dir / fname
+            if p.exists():
+                per_class[cid].append(str(p))
+    paths, labels = [], []
+    for cid in range(len(wnids)):
+        take = per_class[cid][:VAL_PER_CLASS]
+        paths += take
+        labels += [cid] * len(take)
+    return paths, labels
+
+def decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)        # [0..255]; preprocess_input will scale
+    img = tf.cast(img, tf.float32)  # [0..255]
     if train:
-        img = tf.image.random_flip_left_right(img)
-        img = tf.image.random_brightness(img, 0.2)
-        img = tf.image.random_contrast(img, 0.8, 1.2)
+        # NO augmentation in this debug
+        pass
     return img, label
 
-def make_datasets():
-    wnids = (DATA_DIR / "wnids.txt").read_text().splitlines()
-    if OVERFIT_TEST:
-        wnids = wnids[:5]  # tiny subset
-
-    wnid_to_id = {w: i for i, w in enumerate(wnids)}
-
-    # TRAIN — enforce class order via class_names
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        DATA_DIR / "train",
-        labels="inferred",
-        label_mode="int",
-        image_size=IMG_SIZE,
-        batch_size=BATCH,
-        shuffle=True,
-        seed=SEED,
-        class_names=wnids,          # <- force exact order (matches val)
-    ).prefetch(AUTOTUNE)
-
-    # VAL — from annotations mapped to wnids order
-    val_files, val_labels = _load_val_annotations(DATA_DIR / "val", wnid_to_id)
-    val_ds = (tf.data.Dataset.from_tensor_slices((val_files, val_labels))
-              .map(lambda p, y: _decode(p, y, train=False), num_parallel_calls=AUTOTUNE)
-              .batch(BATCH)
-              .prefetch(AUTOTUNE))
-
-    # Sanity prints
-    print("\n=== Sanity: class order (first 10) ===")
-    print(wnids[:10])
-    print("=====================================\n")
-
-    print("=== Sanity: val mappings (8 samples) ===")
-    for f, l in list(zip(val_files, val_labels))[:8]:
-        print(os.path.basename(f), "-> idx=", l)
-    print("=======================================\n")
-
-    return train_ds, val_ds, len(wnids)
-
-# ----------------------------
-# Model
-# ----------------------------
-def build_mobilenet_v2(num_classes: int):
-    base = keras.applications.MobileNetV2(
-        input_shape=(*IMG_SIZE, 3),
-        include_top=False,
-        weights=None
-    )
-    inp = layers.Input(shape=(*IMG_SIZE, 3))
-    x = keras.applications.mobilenet_v2.preprocess_input(inp)  # scales to [-1,1]
-    # IMPORTANT: don't force training=True here; let Keras control BN behavior
-    x = base(x, training=False)
+def mobilenet_head(num_classes):
+    inp = layers.Input(shape=(*IMG_SIZE, 3), dtype=tf.float32)
+    x = keras.applications.mobilenet_v2.preprocess_input(inp)  # scales [-1,1]
+    base = keras.applications.MobileNetV2(include_top=False, input_shape=(*IMG_SIZE,3), weights=None)
+    # DO NOT force training=True here; let Keras control BN
+    x = base(x)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.2)(x)
-    out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+    # NO dropout for overfit
+    out = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out)
     return model, base
 
-# ----------------------------
-# Train
-# ----------------------------
 def main():
-    train_ds, val_ds, num_classes = make_datasets()
-    print(f"Classes: {num_classes} (OVERFIT_TEST={OVERFIT_TEST})")
+    wnids = read_wnids()
+    print("WNIDs (order -> class_id):")
+    for i, w in enumerate(wnids):
+        print(f"  {i} -> {w}")
 
-    model, base = build_mobilenet_v2(num_classes)
+    tr_paths, tr_labels = gather_train_files(wnids)
+    va_paths, va_labels = gather_val_files(wnids)
 
-    # 1) Warmup (freeze backbone)
+    print(f"\nTrain samples: {len(tr_paths)}  Val samples: {len(va_paths)}")
+    print("Class counts (train):",
+          {i: tr_labels.count(i) for i in range(len(wnids))})
+    print("Class counts (val):  ",
+          {i: va_labels.count(i) for i in range(len(wnids))})
+
+    train_ds = (tf.data.Dataset.from_tensor_slices((tr_paths, tr_labels))
+                .shuffle(len(tr_paths), seed=SEED, reshuffle_each_iteration=True)
+                .map(lambda p,y: decode(p,y, train=True), num_parallel_calls=AUTOTUNE)
+                .batch(BATCH)
+                .prefetch(AUTOTUNE))
+
+    val_ds = (tf.data.Dataset.from_tensor_slices((va_paths, va_labels))
+              .map(lambda p,y: decode(p,y, train=False), num_parallel_calls=AUTOTUNE)
+              .batch(BATCH)
+              .prefetch(AUTOTUNE))
+
+    model, base = mobilenet_head(len(wnids))
+
+    # Freeze base for a couple epochs then unfreeze all for overfit
     base.trainable = False
-    model.compile(
-        optimizer=keras.optimizers.AdamW(1e-3),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_HEAD, verbose=2)
+    model.compile(optimizer=keras.optimizers.Adam(1e-3),
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    model.fit(train_ds, validation_data=val_ds, epochs=3, verbose=2)
 
-    # 2) Fine-tune: unfreeze last 70% of layers
-    for i, layer in enumerate(base.layers):
-        layer.trainable = (i >= int(len(base.layers) * 0.7))
+    base.trainable = True  # unfreeze entire backbone to force overfit
+    model.compile(optimizer=keras.optimizers.Adam(1e-4),
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=2)
 
-    lr_cb = keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss", factor=0.5, patience=2, min_lr=1e-5, verbose=1
-    )
-    ckpt_cb = keras.callbacks.ModelCheckpoint(
-        filepath=str(CKPT_DIR / "best.keras"),
-        save_best_only=True, monitor="val_loss", mode="min"
-    )
-    es_cb = keras.callbacks.EarlyStopping(
-        monitor="val_loss", patience=5, restore_best_weights=True
-    )
-    tb_cb = keras.callbacks.TensorBoard(log_dir=str(LOG_DIR))
-
-    model.compile(
-        optimizer=keras.optimizers.AdamW(3e-4),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    hist = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=EPOCHS_FT,
-        callbacks=[lr_cb, ckpt_cb, es_cb, tb_cb],
-        verbose=2,
-    )
-
-    model.save(CKPT_DIR / "final.keras")
-    (BACKBONE_DIR / "backbone.keras").parent.mkdir(parents=True, exist_ok=True)
-    base.save(BACKBONE_DIR / "backbone.keras")
-
-    with open(CKPT_DIR / "history.json", "w") as f:
-        json.dump({k: [float(v) for v in vals] for k, vals in hist.history.items()}, f)
-
-    print("\n✅ Training finished. Saved:")
-    print("  -", CKPT_DIR / "best.keras")
-    print("  -", CKPT_DIR / "final.keras")
-    print("  -", BACKBONE_DIR / "backbone.keras")
+    # Print last few metrics to see trend quickly
+    print("\nLast 5 epochs (acc/val_acc):")
+    for a, va in zip(hist.history["accuracy"][-5:], hist.history["val_accuracy"][-5:]):
+        print(f"  {a:.3f} / {va:.3f}")
 
 if __name__ == "__main__":
     os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
