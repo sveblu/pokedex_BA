@@ -16,7 +16,7 @@ DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
 CKPT_DIR = ROOT / "checkpoints" / "tiny_baseline"
 IMG_SIZE = (64, 64)          # Tiny ImageNet images are 64x64
 BATCH = 64
-EPOCHS = 1                  # set to 1 for smoke test
+EPOCHS = 1                  # Can be set to 1 for smoke test
 SEED = 42
 AUTOTUNE = tf.data.AUTOTUNE
 
@@ -104,12 +104,12 @@ def build_simple_cnn(num_classes: int) -> keras.Model:
         layers.Dense(num_classes, activation="softmax"),
     ])
 
-# Swap to MobileNetV2 later if you want a stronger backbone:
+# Swap to MobileNetV2 later for a stronger backbone:
 def build_mobilenet_head(num_classes: int) -> keras.Model:
     base = keras.applications.MobileNetV2(
         input_shape=(*IMG_SIZE, 3),
         include_top=False,
-        weights=None,          # pretrain yourself here (Tiny ImageNet)
+        weights=None,          # pretrain here (Tiny ImageNet)
     )
     inp = layers.Input(shape=(*IMG_SIZE, 3))
     x = keras.applications.mobilenet_v2.preprocess_input(inp)
