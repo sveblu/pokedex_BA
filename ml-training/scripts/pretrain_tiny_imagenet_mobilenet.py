@@ -1,21 +1,59 @@
-import os, csv, json, pathlib
+import os, csv, json, pathlib, shutil
 from typing import Tuple, List
 
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers  # type: ignore
 
+# --- Paths (Colab-friendly hybrid) ---
+ROOT = pathlib.Path(__file__).resolve().parents[1]  # -> ml-training/
+LOCAL_DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
+
+# Let users override via env var if needed
+ENV_DATA = os.getenv("DATA_DIR", "").strip()
+if ENV_DATA:
+    LOCAL_DATA_DIR = pathlib.Path(ENV_DATA)
+
+# Where a persistent Drive copy could live (adjust the MyDrive path to your choice)
+DRIVE_DATA_DIR = pathlib.Path("/content/drive/MyDrive/datasets/tiny-imagenet-200")
+
+# Checkpoints/logs: keep local for speed, but also mirror to Drive to persist
+LOCAL_CKPT_DIR     = ROOT / "checkpoints" / "tiny_mobilenetv2"
+LOCAL_BACKBONE_DIR = ROOT / "checkpoints" / "backbone_tiny_mnv2"
+LOCAL_LOG_DIR      = ROOT / "checkpoints" / "tblogs"
+
+DRIVE_CKPT_DIR     = pathlib.Path("/content/drive/MyDrive/pokedex_ckpts/tiny_mobilenetv2")
+DRIVE_BACKBONE_DIR = pathlib.Path("/content/drive/MyDrive/pokedex_ckpts/backbone_tiny_mnv2")
+DRIVE_LOG_DIR      = pathlib.Path("/content/drive/MyDrive/pokedex_ckpts/tblogs")
+
+# Helper: ensure local dataset by copying from Drive once if needed
+def ensure_local_dataset():
+    if LOCAL_DATA_DIR.exists():
+        print(f"[data] Using local dataset at: {LOCAL_DATA_DIR}")
+        return
+    if DRIVE_DATA_DIR.exists():
+        print(f"[data] Local dataset missing. Copying from Drive...\n  {DRIVE_DATA_DIR}  ->  {LOCAL_DATA_DIR}")
+        (ROOT / "data").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(DRIVE_DATA_DIR, LOCAL_DATA_DIR)
+        print("[data] Copy complete.")
+        return
+    raise FileNotFoundError(
+        f"Tiny ImageNet not found.\n - Expected local: {LOCAL_DATA_DIR}\n - Or in Drive: {DRIVE_DATA_DIR}\n"
+        "Upload it to Drive (MyDrive/datasets/tiny-imagenet-200) or set DATA_DIR env var."
+    )
+
+ensure_local_dataset()
+
 # ----------------------------
 # Config
 # ----------------------------
-ROOT = pathlib.Path(__file__).resolve().parents[1]      # -> ml-training/
-DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
-CKPT_DIR = ROOT / "checkpoints" / "tiny_mobilenetv2"
-BACKBONE_DIR = ROOT / "checkpoints" / "backbone_tiny_mnv2"
-LOG_DIR = ROOT / "checkpoints" / "tblogs"
+DATA_DIR     = LOCAL_DATA_DIR          # <-- FIXED
+CKPT_DIR     = LOCAL_CKPT_DIR
+BACKBONE_DIR = LOCAL_BACKBONE_DIR
+LOG_DIR      = LOCAL_LOG_DIR
 
 IMG_SIZE = (224, 224)    # upscale Tiny-ImageNet (64->224) for MobileNetV2
-BATCH = 64               # 
+BATCH = 64
 EPOCHS_HEAD = 3          # warm-up head
 EPOCHS_FT = 20           # fine-tune
 SEED = 42
@@ -56,6 +94,14 @@ def _decode(path, label, train=False):
         img = tf.image.random_contrast(img, 0.8, 1.2)
     return img, label
 
+def _decode_from_tensor(x, y, train=False):
+    # x already sized/normalized by image_dataset_from_directory, just augment lightly
+    if train:
+        x = tf.image.random_flip_left_right(x)
+        x = tf.image.random_brightness(x, 0.2)
+        x = tf.image.random_contrast(x, 0.8, 1.2)
+    return x, y
+
 def make_datasets():
     # Train (directory-of-directories) — already batched by Keras util
     train_ds = tf.keras.utils.image_dataset_from_directory(
@@ -63,7 +109,7 @@ def make_datasets():
         labels="inferred",
         label_mode="int",
         image_size=IMG_SIZE,
-        batch_size=BATCH,       # <-- batches here
+        batch_size=BATCH,       # batches here
         shuffle=True,
         seed=SEED,
     )
@@ -78,19 +124,10 @@ def make_datasets():
     val_files, val_labels, wnids = _load_val_annotations(DATA_DIR / "val")
     val_ds = (tf.data.Dataset.from_tensor_slices((val_files, val_labels))
         .map(lambda p, y: _decode(p, y, train=False), num_parallel_calls=AUTOTUNE)
-        .batch(BATCH)           # <-- batch only here
+        .batch(BATCH)
         .prefetch(AUTOTUNE)
     )
-
     return train_ds, val_ds, len(wnids)
-
-def _decode_from_tensor(x, y, train=False):
-    # x already sized/normalized by image_dataset_from_directory, just augment lightly
-    if train:
-        x = tf.image.random_flip_left_right(x)
-        x = tf.image.random_brightness(x, 0.2)
-        x = tf.image.random_contrast(x, 0.8, 1.2)
-    return x, y
 
 # ----------------------------
 # Model (MobileNetV2 backbone)
@@ -99,16 +136,29 @@ def build_mobilenet_v2(num_classes: int) -> keras.Model:
     base = keras.applications.MobileNetV2(
         input_shape=(*IMG_SIZE, 3),
         include_top=False,
-        weights=None  # <- since pretraining myself (no ImageNet weights)
+        weights=None  # pretrain yourself (no ImageNet weights)
     )
     inp = layers.Input(shape=(*IMG_SIZE, 3))
     x = keras.applications.mobilenet_v2.preprocess_input(inp)
     x = base(x, training=True)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.2)(x)
-    out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)  # force float32 on output
+    out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)  # float32 output
     model = keras.Model(inp, out)
     return model, base
+
+# ----------------------------
+# Mirroring helper (define at top level, call inside main)
+# ----------------------------
+def _mirror(src: pathlib.Path, dst: pathlib.Path, label: str):
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        print(f"[mirror] {label}: {src}  ->  {dst}")
+    except Exception as e:
+        print(f"[mirror] Skipped mirroring {label}: {e}")
 
 # ----------------------------
 # Train
@@ -124,7 +174,7 @@ def main():
 
     model, base = build_mobilenet_v2(num_classes)
 
-    # 1) Head warm-up (freeze backbone) Helps to stabilize training
+    # 1) Head warm-up (freeze backbone)
     base.trainable = False
     model.compile(
         optimizer=keras.optimizers.AdamW(1e-3),
@@ -137,7 +187,6 @@ def main():
     for i, layer in enumerate(base.layers):
         layer.trainable = (i >= int(len(base.layers) * 0.7))
 
-    # Optional LR schedule for longer runs
     lr_cb = keras.callbacks.ReduceLROnPlateau(
         monitor="val_accuracy", factor=0.5, patience=2, min_lr=1e-5, verbose=1
     )
@@ -180,6 +229,11 @@ def main():
         print(f"TFLite exported -> {CKPT_DIR/'final_float32.tflite'}")
     except Exception as e:
         print(f"Skipped TFLite export: {e}")
+
+    # Mirror artifacts to Drive (best-effort)
+    _mirror(CKPT_DIR,     DRIVE_CKPT_DIR,     "checkpoints")
+    _mirror(BACKBONE_DIR, DRIVE_BACKBONE_DIR, "backbone")
+    _mirror(LOG_DIR,      DRIVE_LOG_DIR,      "logs")
 
 if __name__ == "__main__":
     main()
