@@ -156,7 +156,7 @@ def main():
     # Stable FT setup
     model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=1e-4, weight_decay=1e-4),
-        loss=keras.losses.SparseCategoricalCrossentropy(label_smoothing=0.1),
+        loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=["accuracy"],
     )
     hist = model.fit(
