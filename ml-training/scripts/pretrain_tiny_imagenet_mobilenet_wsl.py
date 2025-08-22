@@ -82,7 +82,7 @@ def build_model(num_classes: int):
         include_top=False, input_shape=(*IMG_SIZE,3), weights=None
     )
     # Do NOT force training=True/False here; Keras will handle BN correctly
-    x = base(x)
+    x = base(x, training=True)
     x = layers.GlobalAveragePooling2D()(x)
     # No dropout for overfit
     out = layers.Dense(num_classes, activation="softmax")(x)
