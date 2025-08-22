@@ -14,9 +14,9 @@ BACKBONE_DIR = ROOT / "checkpoints" / "backbone_tiny_mnv2"
 LOG_DIR      = ROOT / "checkpoints" / "tblogs"
 
 IMG_SIZE = (224, 224)
-BATCH = 64
-EPOCHS_HEAD = 3
-EPOCHS_FT = 10
+BATCH = 32
+EPOCHS_HEAD = 0
+EPOCHS_FT = 15
 SEED = 42
 AUTOTUNE = tf.data.AUTOTUNE
 OVERFIT_TEST = True   # True = 5-class sanity run; False = full 200 classes
