@@ -8,17 +8,25 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
 IMG_SIZE = (224, 224)
 BATCH = 32
-EPOCHS = 25
+EPOCHS_FROZEN = 3
+EPOCHS_FT = 20
 SEED = 42
 CLASSES = 5
 TRAIN_PER_CLASS = 200   # from train/
-VAL_PER_CLASS   = 100   # from val/
+VAL_PER_CLASS   = 50    # Tiny-ImageNet val has 50 per class
 AUTOTUNE = tf.data.AUTOTUNE
 
 random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# IMPORTANT: keep everything in float32 for this debug
+# Disable XLA JIT to avoid any eval-mode quirks
+try:
+    tf.config.optimizer.set_jit(False)
+except Exception:
+    pass
+
+# Keep everything in float32; no mixed precision for this debug
+# (We’ll re-enable later once val behaves.)
 # tf.keras.mixed_precision.set_global_policy("float32")
 
 def read_wnids():
@@ -36,7 +44,6 @@ def gather_train_files(wnids):
     return paths, labels
 
 def gather_val_files(wnids):
-    # Map val images via val_annotations.txt to our 5 wnids
     ann = (DATA_DIR / "val" / "val_annotations.txt").read_text().splitlines()
     wnid_to_id = {w: i for i, w in enumerate(wnids)}
     images_dir = DATA_DIR / "val" / "images"
@@ -51,7 +58,7 @@ def gather_val_files(wnids):
                 per_class[cid].append(str(p))
     paths, labels = [], []
     for cid in range(len(wnids)):
-        take = per_class[cid][:VAL_PER_CLASS]
+        take = per_class[cid][:VAL_PER_CLASS]  # Tiny-ImageNet ~= 50/class
         paths += take
         labels += [cid] * len(take)
     return paths, labels
@@ -60,20 +67,24 @@ def decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)  # [0..255]
+    # Simple, identical normalization for train & val:
+    img = tf.cast(img, tf.float32) / 255.0
     if train:
-        # NO augmentation in this debug
+        # keep augment OFF for now to reduce variables
         pass
     return img, label
 
-def mobilenet_head(num_classes):
+def build_model(num_classes: int):
     inp = layers.Input(shape=(*IMG_SIZE, 3), dtype=tf.float32)
-    x = keras.applications.mobilenet_v2.preprocess_input(inp)  # scales [-1,1]
-    base = keras.applications.MobileNetV2(include_top=False, input_shape=(*IMG_SIZE,3), weights=None)
-    # DO NOT force training=True here; let Keras control BN
+    x = layers.Rescaling(1.0, offset=0.0)(inp)  # no-op (kept for clarity)
+    # MobileNetV2 WITHOUT special preprocess; we already scaled to [0,1]
+    base = keras.applications.MobileNetV2(
+        include_top=False, input_shape=(*IMG_SIZE,3), weights=None
+    )
+    # Do NOT force training=True/False here; Keras will handle BN correctly
     x = base(x)
     x = layers.GlobalAveragePooling2D()(x)
-    # NO dropout for overfit
+    # No dropout for overfit
     out = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out)
     return model, base
@@ -104,22 +115,27 @@ def main():
               .batch(BATCH)
               .prefetch(AUTOTUNE))
 
-    model, base = mobilenet_head(len(wnids))
+    model, base = build_model(len(wnids))
 
-    # Freeze base for a couple epochs then unfreeze all for overfit
+    # Warm-up a bit (head only)
     base.trainable = False
     model.compile(optimizer=keras.optimizers.Adam(1e-3),
                   loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
-    model.fit(train_ds, validation_data=val_ds, epochs=3, verbose=2)
+    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FROZEN, verbose=2)
 
-    base.trainable = True  # unfreeze entire backbone to force overfit
+    # Overfit: unfreeze EVERYTHING and train longer
+    base.trainable = True
     model.compile(optimizer=keras.optimizers.Adam(1e-4),
                   loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=2)
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, verbose=2)
 
-    # Print last few metrics to see trend quickly
+    # Evaluate explicitly on TRAIN and VAL to compare
+    train_score = model.evaluate(train_ds, verbose=0)
+    val_score = model.evaluate(val_ds, verbose=0)
+    print(f"\nEVAL — train: acc={train_score[1]:.3f}, val: acc={val_score[1]:.3f}")
+
     print("\nLast 5 epochs (acc/val_acc):")
     for a, va in zip(hist.history["accuracy"][-5:], hist.history["val_accuracy"][-5:]):
         print(f"  {a:.3f} / {va:.3f}")
