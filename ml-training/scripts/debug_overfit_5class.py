@@ -27,7 +27,7 @@ try:
     tf.config.optimizer.set_jit(False)  # disable XLA JIT
 except Exception:
     pass
-# Keep float32 for clarity in this debug
+# Keep float32 for clarity
 # tf.keras.mixed_precision.set_global_policy("float32")
 
 # ---------- data helpers ----------
@@ -68,18 +68,19 @@ def decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32) / 255.0  # same norm for train & val
+    img = tf.cast(img, tf.float32)  # [0..255]
+    # IMPORTANT: MobileNetV2 expects [-1, 1]
+    img = keras.applications.mobilenet_v2.preprocess_input(img)
     return img, label
 
 # ---------- model ----------
 def build_model(num_classes: int):
     inp = layers.Input(shape=(*IMG_SIZE, 3), dtype=tf.float32)
-    x = inp  # already [0,1]
     base = keras.applications.MobileNetV2(
         include_top=False, input_shape=(*IMG_SIZE, 3), weights=None
     )
-    # No explicit training flag here; Keras controls BN via train/eval mode
-    x = base(x)
+    # Force BN to inference behavior on forward pass for stability
+    x = base(inp, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     out = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out)
@@ -124,7 +125,7 @@ def main():
                   metrics=["accuracy"])
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FROZEN, verbose=2)
 
-    # Fine-tune: unfreeze backbone but keep all BN layers frozen (stabilize eval)
+    # Fine-tune: unfreeze backbone but keep all BN layers frozen
     base.trainable = True
     for layer in base.layers:
         if isinstance(layer, tf.keras.layers.BatchNormalization):
@@ -135,7 +136,7 @@ def main():
                   metrics=["accuracy"])
     hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, verbose=2)
 
-    # --- diagnostics: compare eval vs train-mode predictions on one batch ---
+    # --- diagnostics: compare predictions on one batch ---
     for xb, yb in val_ds.take(1):
         p_inf = model(xb, training=False).numpy()
         p_trn = model(xb, training=True ).numpy()
