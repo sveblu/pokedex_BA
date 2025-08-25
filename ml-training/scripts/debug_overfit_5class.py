@@ -40,7 +40,7 @@ def decode_img(path, label, train: bool):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32) / 255.0
+    img = tf.cast(img, tf.float32) 
     if train:
         img = tf.image.random_flip_left_right(img)
         img = tf.image.random_brightness(img, 0.15)
