@@ -2,7 +2,7 @@ import os, csv, pathlib, random
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers # type: ignore
+from tensorflow.keras import layers
 
 # ---------- config ----------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -10,25 +10,22 @@ DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
 
 IMG_SIZE = (224, 224)
 BATCH = 32
-EPOCHS_FROZEN = 3
+EPOCHS_FROZEN = 5
 EPOCHS_FT = 20
 SEED = 42
 
-CLASSES = 5                 # first 5 wnids
-TRAIN_PER_CLASS = 200       # images per class for train
-VAL_PER_CLASS   = 50        # Tiny-ImageNet val ~50/class
+CLASSES = 5
+TRAIN_PER_CLASS = 200
+VAL_PER_CLASS   = 50
 
 AUTOTUNE = tf.data.AUTOTUNE
 random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Deterministic as possible for debugging
 try:
-    tf.config.optimizer.set_jit(False)  # disable XLA JIT
+    tf.config.optimizer.set_jit(False)  # disable XLA
 except Exception:
     pass
-# Keep float32 for clarity
-# tf.keras.mixed_precision.set_global_policy("float32")
 
 # ---------- data helpers ----------
 def read_wnids():
@@ -68,8 +65,8 @@ def decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)  # [0..255]
-    # IMPORTANT: MobileNetV2 expects [-1, 1]
+    img = tf.cast(img, tf.float32)
+    # MobileNetV2 expects [-1,1] via its preprocess_input
     img = keras.applications.mobilenet_v2.preprocess_input(img)
     return img, label
 
@@ -79,12 +76,16 @@ def build_model(num_classes: int):
     base = keras.applications.MobileNetV2(
         include_top=False, input_shape=(*IMG_SIZE, 3), weights=None
     )
-    # Force BN to inference behavior on forward pass for stability
-    x = base(inp, training=False)
+    # IMPORTANT: no explicit training flag; Keras will switch based on train/eval,
+    # but freeze BN layers so their behavior stays inference-like.
+    x = base(inp)
     x = layers.GlobalAveragePooling2D()(x)
     out = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out)
     return model, base
+
+def count_trainables(model: keras.Model) -> int:
+    return int(np.sum([np.prod(v.shape) for v in model.trainable_variables]))
 
 # ---------- diagnostics ----------
 def dist_info(name, preds):
@@ -118,25 +119,26 @@ def main():
 
     model, base = build_model(len(wnids))
 
-    # Warm-up (freeze backbone)
+    # Warm-up: train only the head
     base.trainable = False
-    model.compile(optimizer=keras.optimizers.Adam(1e-3),
+    model.compile(optimizer=keras.optimizers.Adam(5e-3),  # a bit higher to kick the head
                   loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
+    print(f"[diag] trainables (warm-up): {count_trainables(model)} params")
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FROZEN, verbose=2)
 
-    # Fine-tune: unfreeze backbone but keep all BN layers frozen
+    # Fine-tune: unfreeze backbone EXCEPT BatchNorm layers
     base.trainable = True
     for layer in base.layers:
         if isinstance(layer, tf.keras.layers.BatchNormalization):
             layer.trainable = False
-
     model.compile(optimizer=keras.optimizers.Adam(1e-4),
                   loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
+    print(f"[diag] trainables (fine-tune): {count_trainables(model)} params")
     hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, verbose=2)
 
-    # --- diagnostics: compare predictions on one batch ---
+    # Diagnostics: compare predictions for one batch
     for xb, yb in val_ds.take(1):
         p_inf = model(xb, training=False).numpy()
         p_trn = model(xb, training=True ).numpy()
@@ -151,7 +153,7 @@ def main():
         dist_info("TRAIN (training=True) ", p_trn)
         break
 
-    # Explicit eval on train and val
+    # Final evals
     train_score = model.evaluate(train_ds, verbose=0)
     val_score = model.evaluate(val_ds, verbose=0)
     print(f"\nEVAL — train: acc={train_score[1]:.3f}, val: acc={val_score[1]:.3f}")
