@@ -2,7 +2,7 @@ import os, csv, pathlib, random
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers # type: ignore
 
 # ---------- config ----------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -10,8 +10,8 @@ DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
 
 IMG_SIZE = (224, 224)
 BATCH = 32
-EPOCHS_FROZEN = 5
-EPOCHS_FT = 20
+EPOCHS_WARMUP = 5          # BN-only warm-up
+EPOCHS_FT = 20             # fine-tune
 SEED = 42
 
 CLASSES = 5
@@ -23,7 +23,7 @@ random.seed(SEED)
 tf.random.set_seed(SEED)
 
 try:
-    tf.config.optimizer.set_jit(False)  # disable XLA
+    tf.config.optimizer.set_jit(False)  # keep it simple
 except Exception:
     pass
 
@@ -65,9 +65,8 @@ def decode(path, label, train=False):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)
-    # MobileNetV2 expects [-1,1] via its preprocess_input
-    img = keras.applications.mobilenet_v2.preprocess_input(img)
+    img = tf.cast(img, tf.float32)        # [0..255]
+    img = keras.applications.mobilenet_v2.preprocess_input(img)  # -> [-1,1]
     return img, label
 
 # ---------- model ----------
@@ -76,9 +75,7 @@ def build_model(num_classes: int):
     base = keras.applications.MobileNetV2(
         include_top=False, input_shape=(*IMG_SIZE, 3), weights=None
     )
-    # IMPORTANT: no explicit training flag; Keras will switch based on train/eval,
-    # but freeze BN layers so their behavior stays inference-like.
-    x = base(inp)
+    x = base(inp)  # Keras toggles training/eval; we'll control BN trainable flags
     x = layers.GlobalAveragePooling2D()(x)
     out = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out)
@@ -86,13 +83,6 @@ def build_model(num_classes: int):
 
 def count_trainables(model: keras.Model) -> int:
     return int(np.sum([np.prod(v.shape) for v in model.trainable_variables]))
-
-# ---------- diagnostics ----------
-def dist_info(name, preds):
-    mean = preds.mean(axis=0)
-    counts = tf.math.bincount(tf.argmax(preds, axis=1), minlength=preds.shape[1]).numpy()
-    print(f"[diag] {name} softmax mean:", np.round(mean, 3))
-    print(f"[diag] {name} argmax counts:", counts)
 
 # ---------- train ----------
 def main():
@@ -119,26 +109,42 @@ def main():
 
     model, base = build_model(len(wnids))
 
-    # Warm-up: train only the head
-    base.trainable = False
-    model.compile(optimizer=keras.optimizers.Adam(5e-3),  # a bit higher to kick the head
-                  loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"])
-    print(f"[diag] trainables (warm-up): {count_trainables(model)} params")
-    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FROZEN, verbose=2)
+    # ---- WARM-UP: Update ONLY BatchNorm moving stats (convs frozen)
+    for layer in base.layers:
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = True
+        else:
+            layer.trainable = False
 
-    # Fine-tune: unfreeze backbone EXCEPT BatchNorm layers
+    # call with training=True so BN updates moving_mean/var
+    model.compile(optimizer=keras.optimizers.Adam(1e-3),
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"],
+                  run_eagerly=False)
+    print(f"[diag] trainables (warm-up): {count_trainables(model)} params (should be BN + head)")
+    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_WARMUP,
+              verbose=2)
+
+    # ---- FINE-TUNE: Unfreeze convs, FREEZE all BN
     base.trainable = True
     for layer in base.layers:
         if isinstance(layer, tf.keras.layers.BatchNormalization):
             layer.trainable = False
+
     model.compile(optimizer=keras.optimizers.Adam(1e-4),
                   loss="sparse_categorical_crossentropy",
                   metrics=["accuracy"])
-    print(f"[diag] trainables (fine-tune): {count_trainables(model)} params")
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, verbose=2)
+    print(f"[diag] trainables (fine-tune): {count_trainables(model)} params (millions expected)")
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT,
+                     verbose=2)
 
-    # Diagnostics: compare predictions for one batch
+    # --- diagnostics: predictions distribution on one batch
+    def dist_info(name, preds):
+        mean = preds.mean(axis=0)
+        counts = tf.math.bincount(tf.argmax(preds, axis=1), minlength=preds.shape[1]).numpy()
+        print(f"[diag] {name} softmax mean:", np.round(mean, 3))
+        print(f"[diag] {name} argmax counts:", counts)
+
     for xb, yb in val_ds.take(1):
         p_inf = model(xb, training=False).numpy()
         p_trn = model(xb, training=True ).numpy()
@@ -153,10 +159,9 @@ def main():
         dist_info("TRAIN (training=True) ", p_trn)
         break
 
-    # Final evals
-    train_score = model.evaluate(train_ds, verbose=0)
-    val_score = model.evaluate(val_ds, verbose=0)
-    print(f"\nEVAL — train: acc={train_score[1]:.3f}, val: acc={val_score[1]:.3f}")
+    tr = model.evaluate(train_ds, verbose=0)
+    va = model.evaluate(val_ds, verbose=0)
+    print(f"\nEVAL — train: acc={tr[1]:.3f}, val: acc={va[1]:.3f}")
 
     print("\nLast 5 epochs (acc/val_acc):")
     for a, va in zip(hist.history["accuracy"][-5:], hist.history["val_accuracy"][-5:]):
