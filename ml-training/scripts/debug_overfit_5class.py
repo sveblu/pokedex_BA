@@ -1,172 +1,182 @@
-import os, csv, pathlib, random
-import numpy as np
+# scripts/debug_overfit_5class.py
+import os, csv, random, pathlib, numpy as np
+from typing import List, Tuple
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers # type: ignore
 
-# ---------- config ----------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "tiny-imagenet-200"
-
-IMG_SIZE = (224, 224)
+IMG_SIZE = (224, 224)                 # Tiny-ImageNet is 64x64; we upscale for MobileNetV2
 BATCH = 32
-EPOCHS_WARMUP = 5          # BN-only warm-up
-EPOCHS_FT = 20             # fine-tune
 SEED = 42
 
-CLASSES = 5
-TRAIN_PER_CLASS = 200
-VAL_PER_CLASS   = 50
-
-AUTOTUNE = tf.data.AUTOTUNE
+# keep runs quick and deterministic
 random.seed(SEED)
+np.random.seed(SEED)
 tf.random.set_seed(SEED)
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
-try:
-    tf.config.optimizer.set_jit(False)  # keep it simple
-except Exception:
-    pass
+# ---------- helpers ----------
+def read_wnids(d: pathlib.Path) -> List[str]:
+    return (d / "wnids.txt").read_text().strip().splitlines()
 
-# ---------- data helpers ----------
-def read_wnids():
-    wnids = (DATA_DIR / "wnids.txt").read_text().strip().splitlines()
-    return wnids[:CLASSES]
+def take_first_n(classes: List[str], n: int = 5) -> List[str]:
+    return classes[:n]
 
-def gather_train_files(wnids):
-    paths, labels = [], []
-    for cid, wnid in enumerate(wnids):
-        d = DATA_DIR / "train" / wnid / "images"
-        imgs = sorted([*d.glob("*.JPEG"), *d.glob("*.jpg")])[:TRAIN_PER_CLASS]
-        paths += [str(p) for p in imgs]
-        labels += [cid] * len(imgs)
-    return paths, labels
+def parse_val_file(val_dir: pathlib.Path, keep_wnids: List[str]) -> List[Tuple[str,int]]:
+    wnid_to_idx = {w:i for i,w in enumerate(keep_wnids)}
+    out = []
+    with (val_dir/"val_annotations.txt").open("r", newline="") as f:
+        r = csv.reader(f, delimiter="\t")
+        for row in r:
+            fname, wnid = row[0], row[1]
+            if wnid in wnid_to_idx:
+                out.append((str(val_dir/"images"/fname), wnid_to_idx[wnid]))
+    return out
 
-def gather_val_files(wnids):
-    ann = (DATA_DIR / "val" / "val_annotations.txt").read_text().splitlines()
-    wnid_to_id = {w: i for i, w in enumerate(wnids)}
-    images_dir = DATA_DIR / "val" / "images"
-    per_class = {i: [] for i in range(len(wnids))}
-    for line in ann:
-        parts = line.split("\t")
-        fname, wnid = parts[0], parts[1]
-        if wnid in wnid_to_id:
-            cid = wnid_to_id[wnid]
-            p = images_dir / fname
-            if p.exists():
-                per_class[cid].append(str(p))
-    paths, labels = [], []
-    for cid in range(len(wnids)):
-        take = per_class[cid][:VAL_PER_CLASS]
-        paths += take
-        labels += [cid] * len(take)
-    return paths, labels
-
-def decode(path, label, train=False):
+def decode_img(path, label, train: bool):
     img = tf.io.read_file(path)
     img = tf.io.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32)        # [0..255]
-    img = keras.applications.mobilenet_v2.preprocess_input(img)  # -> [-1,1]
+    img = tf.cast(img, tf.float32) / 255.0
+    if train:
+        img = tf.image.random_flip_left_right(img)
+        img = tf.image.random_brightness(img, 0.15)
+        img = tf.image.random_contrast(img, 0.85, 1.15)
     return img, label
 
+def make_datasets() -> Tuple[tf.data.Dataset, tf.data.Dataset, List[str]]:
+    # choose 5 classes in a fixed order
+    all_wnids = read_wnids(DATA_DIR)
+    keep = take_first_n(all_wnids, 5)
+    print("\nWNIDs (order -> class_id):")
+    for i, w in enumerate(keep):
+        print(f"  {i} -> {w}")
+
+    # train: directory structure train/<wnid>/images/*.JPEG
+    train_files, train_labels = [], []
+    for idx, wnid in enumerate(keep):
+        img_dir = DATA_DIR / "train" / wnid / "images"
+        files = sorted([str(p) for p in img_dir.glob("*.JPEG")])
+        train_files += files
+        train_labels += [idx] * len(files)
+
+    # val: flat images + mapping file
+    val_pairs = parse_val_file(DATA_DIR / "val", keep)
+    val_files = [p for p, _ in val_pairs]
+    val_labels = [y for _, y in val_pairs]
+
+    print(f"\nTrain samples: {len(train_files)}  Val samples: {len(val_files)}")
+    # quick histogram to make sure labels are spread
+    t_counts = {i: int(np.sum(np.array(train_labels)==i)) for i in range(len(keep))}
+    v_counts = {i: int(np.sum(np.array(val_labels)==i)) for i in range(len(keep))}
+    print("Class counts (train):", t_counts)
+    print("Class counts (val):  ", v_counts)
+
+    train_ds = tf.data.Dataset.from_tensor_slices((train_files, train_labels))
+    train_ds = (train_ds
+                .shuffle(len(train_files), seed=SEED, reshuffle_each_iteration=True)
+                .map(lambda p,y: decode_img(p,y,train=True), num_parallel_calls=tf.data.AUTOTUNE)
+                .batch(BATCH)
+                .prefetch(tf.data.AUTOTUNE))
+
+    val_ds = tf.data.Dataset.from_tensor_slices((val_files, val_labels))
+    val_ds = (val_ds
+              .map(lambda p,y: decode_img(p,y,train=False), num_parallel_calls=tf.data.AUTOTUNE)
+              .batch(BATCH)
+              .prefetch(tf.data.AUTOTUNE))
+
+    return train_ds, val_ds, keep
+
+def count_trainables(model: keras.Model) -> int:
+    return int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
+
 # ---------- model ----------
-def build_model(num_classes: int):
-    inp = layers.Input(shape=(*IMG_SIZE, 3), dtype=tf.float32)
+def build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
     base = keras.applications.MobileNetV2(
-        include_top=False, input_shape=(*IMG_SIZE, 3), weights=None
+        input_shape=(*IMG_SIZE, 3),
+        include_top=False,
+        weights="imagenet",            # for this debug, imagenet weights help
+        pooling=None
     )
-    x = base(inp)  # Keras toggles training/eval; we'll control BN trainable flags
+    inp = layers.Input(shape=(*IMG_SIZE, 3))
+    x = keras.applications.mobilenet_v2.preprocess_input(inp)
+    x = base(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
-    out = layers.Dense(num_classes, activation="softmax")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
     model = keras.Model(inp, out)
     return model, base
 
-def count_trainables(model: keras.Model) -> int:
-    return int(np.sum([np.prod(v.shape) for v in model.trainable_variables]))
-
 # ---------- train ----------
 def main():
-    wnids = read_wnids()
-    print("WNIDs (order -> class_id):")
-    for i, w in enumerate(wnids):
-        print(f"  {i} -> {w}")
+    train_ds, val_ds, keep = make_datasets()
+    num_classes = len(keep)
+    model, base = build_model(num_classes)
 
-    tr_paths, tr_labels = gather_train_files(wnids)
-    va_paths, va_labels = gather_val_files(wnids)
-    print(f"\nTrain samples: {len(tr_paths)}  Val samples: {len(va_paths)}")
-    print("Class counts (train):", {i: tr_labels.count(i) for i in range(len(wnids))})
-    print("Class counts (val):  ", {i: va_labels.count(i) for i in range(len(wnids))})
-
-    train_ds = (tf.data.Dataset.from_tensor_slices((tr_paths, tr_labels))
-                .shuffle(len(tr_paths), seed=SEED, reshuffle_each_iteration=True)
-                .map(lambda p,y: decode(p,y, train=True), num_parallel_calls=AUTOTUNE)
-                .batch(BATCH)
-                .prefetch(AUTOTUNE))
-    val_ds = (tf.data.Dataset.from_tensor_slices((va_paths, va_labels))
-              .map(lambda p,y: decode(p,y, train=False), num_parallel_calls=AUTOTUNE)
-              .batch(BATCH)
-              .prefetch(AUTOTUNE))
-
-    model, base = build_model(len(wnids))
-
-    # ---- WARM-UP: Update ONLY BatchNorm moving stats (convs frozen)
+    # WARM-UP: freeze all convs, keep BN updating stats + train the head
     for layer in base.layers:
         if isinstance(layer, tf.keras.layers.BatchNormalization):
             layer.trainable = True
         else:
             layer.trainable = False
 
-    # call with training=True so BN updates moving_mean/var
-    model.compile(optimizer=keras.optimizers.Adam(1e-3),
-                  loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"],
-                  run_eagerly=False)
-    print(f"[diag] trainables (warm-up): {count_trainables(model)} params (should be BN + head)")
-    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_WARMUP,
-              verbose=2)
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    print(f"[diag] trainables (warm-up): {count_trainables(model)} params")
+    model.fit(train_ds, validation_data=val_ds, epochs=5, verbose=2)
 
-    # ---- FINE-TUNE: Unfreeze convs, FREEZE all BN
-    base.trainable = True
+    # FINE-TUNE: unfreeze all non-BN layers, freeze BN
     for layer in base.layers:
         if isinstance(layer, tf.keras.layers.BatchNormalization):
             layer.trainable = False
+        else:
+            layer.trainable = True   # <-- critical: actually unfreeze convs
 
-    model.compile(optimizer=keras.optimizers.Adam(1e-4),
-                  loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"])
-    print(f"[diag] trainables (fine-tune): {count_trainables(model)} params (millions expected)")
-    hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT,
-                     verbose=2)
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-4),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    print(f"[diag] trainables (fine-tune): {count_trainables(model)} params (should be in the millions)")
 
-    # --- diagnostics: predictions distribution on one batch
-    def dist_info(name, preds):
-        mean = preds.mean(axis=0)
-        counts = tf.math.bincount(tf.argmax(preds, axis=1), minlength=preds.shape[1]).numpy()
-        print(f"[diag] {name} softmax mean:", np.round(mean, 3))
-        print(f"[diag] {name} argmax counts:", counts)
+    hist = model.fit(train_ds, validation_data=val_ds, epochs=20, verbose=2)
 
-    for xb, yb in val_ds.take(1):
-        p_inf = model(xb, training=False).numpy()
-        p_trn = model(xb, training=True ).numpy()
-        dist_info("VAL (training=False)", p_inf)
-        dist_info("VAL (training=True) ", p_trn)
-        break
+    # quick end-of-run diagnostics on a tiny batch
+    def softmax_diag(ds, training_flag):
+        for xb, _ in ds.take(1):
+            probs = model(xb, training=training_flag).numpy()
+            m = probs.mean(axis=0)
+            counts = np.bincount(probs.argmax(axis=1), minlength=num_classes)
+            return m, counts
+        return None, None
 
-    for xb, yb in train_ds.take(1):
-        p_inf = model(xb, training=False).numpy()
-        p_trn = model(xb, training=True ).numpy()
-        dist_info("TRAIN (training=False)", p_inf)
-        dist_info("TRAIN (training=True) ", p_trn)
-        break
+    m_val_f, c_val_f = softmax_diag(val_ds, training_flag=False)
+    m_val_t, c_val_t = softmax_diag(val_ds, training_flag=True)
+    m_tr_f,  c_tr_f  = softmax_diag(train_ds, training_flag=False)
+    m_tr_t,  c_tr_t  = softmax_diag(train_ds, training_flag=True)
 
-    tr = model.evaluate(train_ds, verbose=0)
-    va = model.evaluate(val_ds, verbose=0)
-    print(f"\nEVAL — train: acc={tr[1]:.3f}, val: acc={va[1]:.3f}")
+    print("\n[diag] VAL (training=False) softmax mean:", np.round(m_val_f, 3))
+    print("[diag] VAL (training=False) argmax counts:", c_val_f)
+    print("[diag] VAL (training=True)  softmax mean:", np.round(m_val_t, 3))
+    print("[diag] VAL (training=True)  argmax counts:", c_val_t)
+    print("[diag] TRAIN (training=False) softmax mean:", np.round(m_tr_f, 3))
+    print("[diag] TRAIN (training=False) argmax counts:", c_tr_f)
+    print("[diag] TRAIN (training=True)  softmax mean:", np.round(m_tr_t, 3))
+    print("[diag] TRAIN (training=True)  argmax counts:", c_tr_t)
 
+    # compact summary
+    def last(xs, k=5): return xs[-k:] if xs else []
+    print("\nEVAL — train: acc=%.3f, val: acc=%.3f" %
+          (hist.history["accuracy"][-1], hist.history["val_accuracy"][-1]))
     print("\nLast 5 epochs (acc/val_acc):")
-    for a, va in zip(hist.history["accuracy"][-5:], hist.history["val_accuracy"][-5:]):
+    for a, va in zip(last(hist.history["accuracy"]), last(hist.history["val_accuracy"])):
         print(f"  {a:.3f} / {va:.3f}")
 
 if __name__ == "__main__":
-    os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
     main()
