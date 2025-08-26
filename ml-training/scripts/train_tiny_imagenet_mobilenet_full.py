@@ -1,351 +1,371 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Tiny-ImageNet (200 classes) training with MobileNetV2 (ImageNet-pretrained).
+MobileNetV2 on Tiny-ImageNet-200 with a memory-safe tf.data pipeline.
 
-Key points:
-- Loads the official Tiny-ImageNet directory structure.
-- Uses `mobilenet_v2.preprocess_input` INSIDE the model. No external /255 scaling.
-- Warms up by training only the classification head, then fine-tunes upper backbone blocks.
-- Adds light data augmentation, ReduceLROnPlateau, EarlyStopping, and checkpoints.
-- Avoids training BatchNorm layers during fine-tuning.
+Key characteristics
+- Fixed class ordering from wnids.txt to ensure stable label indices.
+- Validation labels constructed from val_annotations.txt.
+- No in-memory dataset cache (prevents host-pinned OOM); optional on-disk cache.
+- Two-stage training: classifier head warm-up, then partial backbone fine-tuning.
+- Conservative defaults for 6 GB GPUs; configurable via CLI flags.
 
-Expected dataset layout (unzipped Tiny-ImageNet-200):
-  TINY_IMAGENET_ROOT/
+Directory layout expected (standard Tiny-ImageNet):
+  <root>/
+    wnids.txt
+    words.txt
     train/<WNID>/images/*.JPEG
     val/images/*.JPEG
-    val/val_annotations.txt      (filename -> wnid mapping)
-    wnids.txt, words.txt, ...
-
-Set `TINY_IMAGENET_ROOT` below if required.
+    val/val_annotations.txt
 """
 
+from __future__ import annotations
 import os
-import csv
+import argparse
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Tuple
 
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.applications import mobilenet_v2
+
+# ----------------------------- Runtime configuration -----------------------------
+
+# Disable XLA to avoid large host-pinned buffers during data ingest.
+# It can be re-enabled later once the pipeline is stable.
+tf.config.optimizer.set_jit(False)
+
+# Enable dynamic GPU memory growth for WSL / consumer GPUs.
+gpus = tf.config.list_physical_devices("GPU")
+for g in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(g, True)
+    except Exception:
+        pass  # Fallback silently if not supported
+
+AUTOTUNE = tf.data.AUTOTUNE
 
 
-# -----------------------------
-# Configuration
-# -----------------------------
+# ----------------------------- Data pipeline ------------------------------------
 
-# Root of the Tiny-ImageNet dataset. Adjust if needed.
-TINY_IMAGENET_ROOT = os.environ.get(
-    "TINY_IMAGENET_ROOT", str(Path.home() / "data" / "tiny-imagenet-200")
-)
-
-# Training knobs
-IMAGE_SIZE = (224, 224)
-BATCH_SIZE = 32
-SEED = 1337
-
-# Warm-up (head only), then fine-tune
-WARMUP_EPOCHS = 5
-FINETUNE_EPOCHS = 20
-
-# Fine-tuning: unfreeze the top N layers of the backbone (BatchNorm stays frozen)
-UNFREEZE_TOP_N_LAYERS = 60
-
-# Checkpoint directory
-CKPT_DIR = Path("checkpoints") / "tiny_mobilenetv2_full"
-CKPT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
-
-def list_wnids_train(train_dir: Path) -> List[str]:
+def build_lookup_tables(root: Path) -> Tuple[tf.lookup.StaticHashTable, tf.lookup.StaticHashTable, list[str]]:
     """
-    Discovers WNIDs from train/ subfolders and returns a deterministic class list.
-    The order is used as the single source of truth for class indexing.
+    Builds two lookup tables:
+      - wnid_to_index: maps WNID string -> class index [0..C-1]
+      - valfile_to_index: maps validation filename (e.g., 'val_0.JPEG') -> class index
+    Returns both tables and the ordered list of WNIDs.
     """
-    wnids = sorted([p.name for p in train_dir.iterdir() if p.is_dir()])
-    if len(wnids) != 200:
-        print(f"[warn] Expected 200 WNIDs, found {len(wnids)}.")
-    return wnids
+    wnids = [w.strip() for w in (root / "wnids.txt").read_text().splitlines() if w.strip()]
+    assert len(wnids) > 0, "wnids.txt is empty or missing classes."
+
+    # WNID -> integer index
+    wnid_keys = tf.constant(wnids, dtype=tf.string)
+    wnid_vals = tf.range(len(wnids), dtype=tf.int32)
+    wnid_init = tf.lookup.KeyValueTensorInitializer(wnid_keys, wnid_vals)
+    wnid_to_index = tf.lookup.StaticHashTable(wnid_init, default_value=-1)
+
+    # Validation filename -> integer index (from val_annotations.txt)
+    ann_path = root / "val" / "val_annotations.txt"
+    assert ann_path.exists(), f"Missing: {ann_path}"
+    val_lines = [ln.strip() for ln in ann_path.read_text().splitlines() if ln.strip()]
+    val_files, val_inds = [], []
+    for ln in val_lines:
+        # Format: "<filename>\t<wnid>\t<x>\t<y>\t<w>\t<h>"
+        parts = ln.split("\t")
+        fname = parts[0]
+        wnid = parts[1]
+        idx = wnids.index(wnid)  # raises if inconsistent
+        val_files.append(fname)
+        val_inds.append(idx)
+
+    vf_keys = tf.constant(val_files, dtype=tf.string)
+    vf_vals = tf.constant(val_inds, dtype=tf.int32)
+    vf_init = tf.lookup.KeyValueTensorInitializer(vf_keys, vf_vals)
+    valfile_to_index = tf.lookup.StaticHashTable(vf_init, default_value=-1)
+
+    return wnid_to_index, valfile_to_index, wnids
 
 
-def parse_val_annotations(val_dir: Path) -> List[Tuple[str, str]]:
+def make_datasets(
+    root_dir: str,
+    batch_size: int = 32,
+    image_size: tuple[int, int] = (224, 224),
+    cache_to_disk: bool = True,
+) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, list[str]]:
     """
-    Parses val/val_annotations.txt into a list of (filename, wnid).
+    Creates memory-safe tf.data pipelines for train and validation.
+
+    Design decisions
+    - No in-memory `Dataset.cache()` to avoid large host-pinned allocations.
+    - Optional on-disk cache at ~/.tfdata_cache/tiny-imagenet-200/*.cache.
+    - Fixed class indices via wnids.txt; validation labels from val_annotations.txt.
     """
-    annot_path = val_dir / "val_annotations.txt"
-    pairs: List[Tuple[str, str]] = []
-    with open(annot_path, "r") as f:
-        reader = csv.reader(f, delimiter="\t")
-        for row in reader:
-            # Format per line: <filename>\t<wnid>\t<x>\t<y>\t<w>\t<h>
-            filename, wnid = row[0], row[1]
-            pairs.append((filename, wnid))
-    return pairs
+    root = Path(root_dir)
+    train_dir = root / "train"
+    val_img_dir = root / "val" / "images"
 
+    assert train_dir.exists(), f"Missing: {train_dir}"
+    assert val_img_dir.exists(), f"Missing: {val_img_dir}"
+    assert (root / "wnids.txt").exists(), f"Missing: {root / 'wnids.txt'}"
+    assert (root / "val" / "val_annotations.txt").exists(), "val_annotations.txt missing"
 
-def make_train_dataset(train_dir: Path, class_names: List[str]) -> tf.data.Dataset:
-    """
-    Builds the training dataset from train/ subfolders using image_dataset_from_directory.
-    Uses the provided class_names to fix label ordering across train/val.
-    """
-    ds = tf.keras.utils.image_dataset_from_directory(
-        directory=str(train_dir),
-        labels="inferred",
-        label_mode="int",
-        class_names=class_names,  # critical to align labels with val set
-        color_mode="rgb",
-        batch_size=BATCH_SIZE,
-        image_size=IMAGE_SIZE,
-        shuffle=True,
-        seed=SEED,
-    )
-    # Cache + prefetch for performance
-    return ds.cache().prefetch(tf.data.AUTOTUNE)
+    wnid_to_index, valfile_to_index, wnids = build_lookup_tables(root)
+    num_classes = len(wnids)
 
-
-def make_val_dataset(val_dir: Path, class_names: List[str]) -> tf.data.Dataset:
-    """
-    Builds the validation dataset directly from val/images plus val_annotations.txt.
-    Ensures labels align with the same class_names ordering as train.
-    """
-    pairs = parse_val_annotations(val_dir)
-    wnid_to_index: Dict[str, int] = {wnid: idx for idx, wnid in enumerate(class_names)}
-
-    filepaths = []
-    labels = []
-    images_dir = val_dir / "images"
-    for filename, wnid in pairs:
-        fp = str(images_dir / filename)
-        if wnid not in wnid_to_index:
-            # Unseen wnid, skip defensively (should not happen in official set)
-            continue
-        filepaths.append(fp)
-        labels.append(wnid_to_index[wnid])
-
-    path_ds = tf.data.Dataset.from_tensor_slices(filepaths)
-    label_ds = tf.data.Dataset.from_tensor_slices(tf.cast(labels, tf.int32))
-
-    def load_and_resize(path: tf.Tensor) -> tf.Tensor:
-        img = tf.io.read_file(path)
-        img = tf.io.decode_jpeg(img, channels=3)
-        img = tf.image.resize(img, IMAGE_SIZE, method=tf.image.ResizeMethod.BILINEAR)
-        # Keep dtype uint8 → the model's preprocess_input will handle casting/scaling.
-        img = tf.cast(img, tf.uint8)
+    # Decoder and basic preprocessing
+    def _decode_and_resize(img_bytes: tf.Tensor) -> tf.Tensor:
+        img = tf.image.decode_jpeg(img_bytes, channels=3)
+        img = tf.image.resize(img, image_size, antialias=True)
+        img = tf.cast(img, tf.float32) / 255.0
         return img
 
-    img_ds = path_ds.map(load_and_resize, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = tf.data.Dataset.zip((img_ds, label_ds))
+    # Train: derive label from directory name (.../train/<WNID>/images/<file>)
+    def _load_train(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        img_bytes = tf.io.read_file(path)
+        img = _decode_and_resize(img_bytes)
+        parts = tf.strings.split(path, os.sep)
+        wnid = parts[-3]  # "<WNID>"
+        label = wnid_to_index.lookup(wnid)
+        return img, label
 
-    # Batch without shuffling (validation)
-    ds = ds.batch(BATCH_SIZE)
-    return ds.cache().prefetch(tf.data.AUTOTUNE)
+    # Val: derive label from filename using val_annotations mapping
+    def _load_val(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        img_bytes = tf.io.read_file(path)
+        img = _decode_and_resize(img_bytes)
+        fname = tf.strings.split(path, os.sep)[-1]
+        label = valfile_to_index.lookup(fname)
+        return img, label
 
+    # Lists of files
+    train_files = tf.data.Dataset.list_files(str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True)
+    val_files = tf.data.Dataset.list_files(str(val_img_dir / "*.JPEG"), shuffle=False)
 
-def build_model(num_classes: int) -> keras.Model:
-    """
-    Constructs MobileNetV2 classifier with augmentations and proper preprocessing.
-    Preprocessing is applied inside the model to avoid double normalization elsewhere.
-    """
-    inputs = keras.Input(shape=(*IMAGE_SIZE, 3), dtype=tf.uint8, name="input_uint8")
-
-    # Data augmentation (kept light). These layers will cast to float internally.
+    # Augmentations (lightweight; compatible with validation pipeline)
     aug = keras.Sequential(
         [
-            layers.RandomFlip("horizontal"),
-            layers.RandomRotation(0.05),
-            layers.RandomZoom(0.1),
-            layers.RandomContrast(0.1),
+            keras.layers.RandomFlip("horizontal"),
+            keras.layers.RandomRotation(0.05),
+            keras.layers.RandomZoom(0.1),
         ],
         name="augment",
     )
 
-    # Preprocessing required by MobileNetV2 (expects float in [0..255], maps to [-1, 1])
-    x = aug(inputs)
-    x = layers.Lambda(mobilenet_v2.preprocess_input, name="preprocess")(x)
+    def _map_train(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        img, label = _load_train(path)
+        img = aug(img)
+        return img, label
 
-    # Backbone
-    backbone = mobilenet_v2.MobileNetV2(
-        input_shape=(*IMAGE_SIZE, 3),
+    # Assemble datasets (no in-memory cache)
+    train_ds = (
+        train_files
+        .shuffle(20_000)
+        .map(_map_train, num_parallel_calls=AUTOTUNE)
+        .batch(batch_size, drop_remainder=True)
+        .prefetch(2)
+    )
+    val_ds = (
+        val_files
+        .map(_load_val, num_parallel_calls=AUTOTUNE)
+        .batch(batch_size, drop_remainder=False)
+        .prefetch(2)
+    )
+
+    # Optional: on-disk cache (safe). Speeds up subsequent epochs without consuming RAM.
+    if cache_to_disk:
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        train_ds = train_ds.cache(str(cache_root / "train.cache"))
+        val_ds = val_ds.cache(str(cache_root / "val.cache"))
+
+    return train_ds, val_ds, num_classes, wnids
+
+
+# ----------------------------- Model definition ---------------------------------
+
+def build_model(num_classes: int) -> keras.Model:
+    """
+    Constructs MobileNetV2 backbone with a classifier head.
+    """
+    base = keras.applications.MobileNetV2(
+        input_shape=(224, 224, 3),
         include_top=False,
         weights="imagenet",
-        pooling=None,
     )
-    backbone.trainable = False  # frozen during warm-up
-
-    x = backbone(x, training=False)  # BN stays in inference mode while frozen
-    x = layers.GlobalAveragePooling2D(name="gap")(x)
-    x = layers.Dropout(0.2, name="dropout")(x)
-    outputs = layers.Dense(num_classes, activation="softmax", name="classifier")(x)
-
-    model = keras.Model(inputs, outputs, name="tiny_imagenet_mnv2")
-    return model
+    x = keras.Input(shape=(224, 224, 3))
+    y = base(x, training=False)  # frozen batchnorm statistics during warm-up
+    y = keras.layers.GlobalAveragePooling2D()(y)
+    y = keras.layers.Dropout(0.2)(y)
+    out = keras.layers.Dense(num_classes, activation="softmax")(y)
+    model = keras.Model(x, out, name="mobilenetv2_tiny_imagenet")
+    return model, base
 
 
-def count_trainable_params(model: keras.Model) -> int:
+def unfreeze_tail(base: keras.Model, num_unfrozen: int = 40) -> None:
     """
-    Returns the count of trainable parameters.
+    Unfreezes the last `num_unfrozen` layers of `base` for fine-tuning, while keeping
+    BatchNormalization layers frozen to preserve stable statistics.
     """
-    return int(
-        sum(tf.reduce_prod(tf.shape(v)).numpy() for v in model.trainable_variables)
-    )
-
-
-def set_backbone_trainable(backbone: keras.Model, unfreeze_top_n: int) -> None:
-    """
-    Unfreezes the top N layers of the backbone while keeping BatchNorm layers frozen.
-    This pattern stabilizes fine-tuning for MobileNet-like architectures.
-    """
-    # Unfreeze entire backbone first
-    backbone.trainable = True
-
-    # Freeze all layers by default
-    for layer in backbone.layers:
+    # Freeze all first
+    for layer in base.layers:
         layer.trainable = False
 
-    # Unfreeze the last `unfreeze_top_n` layers except BatchNorm
-    layers_to_unfreeze = backbone.layers[-unfreeze_top_n:] if unfreeze_top_n > 0 else []
-    for layer in layers_to_unfreeze:
-        # Skip BatchNorm layers
-        if isinstance(layer, layers.BatchNormalization):
+    # Unfreeze tail except BatchNorm
+    for layer in base.layers[-num_unfrozen:]:
+        if isinstance(layer, keras.layers.BatchNormalization):
             layer.trainable = False
         else:
             layer.trainable = True
 
 
-def main():
-    tf.keras.utils.set_random_seed(SEED)
+# ----------------------------- Diagnostics --------------------------------------
 
-    root = Path(TINY_IMAGENET_ROOT)
-    train_dir = root / "train"
-    val_dir = root / "val"
-
-    assert train_dir.exists(), f"Missing: {train_dir}"
-    assert (val_dir / "images").exists(), f"Missing: {val_dir/'images'}"
-    assert (val_dir / "val_annotations.txt").exists(), f"Missing: {val_dir/'val_annotations.txt'}"
-
-    # Discover class list from train/ and reuse identically for val/
-    class_names = list_wnids_train(train_dir)
-    num_classes = len(class_names)
-
+def print_mapping_summary(wnids: list[str], limit: int = 10) -> None:
+    """
+    Prints the first few WNIDs and their indices for sanity checking.
+    """
     print("\nWNIDs (order -> class_id):")
-    for i, wnid in enumerate(class_names[:10]):
-        print(f"  {i:>3} -> {wnid}")
-    if num_classes > 10:
+    for i, w in enumerate(wnids[:limit]):
+        print(f"  {i:<2d} -> {w}")
+    if len(wnids) > limit:
         print("  ...")
-    print(f"\nClasses detected: {num_classes}\n")
+    print(f"\nClasses detected: {len(wnids)}\n")
+
+
+def quick_distribution_check(model: keras.Model, ds: tf.data.Dataset, name: str, steps: int = 2) -> None:
+    """
+    Computes softmax mean and argmax histograms over a few batches to ensure
+    outputs are non-degenerate after training.
+    """
+    import numpy as np
+    probs_all = []
+    preds_all = []
+    for i, (xb, _) in enumerate(ds.take(steps)):
+        p = model.predict(xb, verbose=0)
+        probs_all.append(p)
+        preds_all.append(p.argmax(axis=1))
+    probs = np.concatenate(probs_all, axis=0)
+    preds = np.concatenate(preds_all, axis=0)
+    mean = probs.mean(axis=0)
+    bincount = np.bincount(preds, minlength=probs.shape[1])
+    topk = 5 if probs.shape[1] >= 5 else probs.shape[1]
+    print(f"[diag] {name} softmax mean (first {topk}): {mean[:topk].round(3)}")
+    print(f"[diag] {name} argmax counts (first {topk}): {bincount[:topk]}\n")
+
+
+# ----------------------------- Training routine ---------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="MobileNetV2 on Tiny-ImageNet-200 (memory-safe pipeline)")
+    parser.add_argument("--data_root", type=str, required=True, help="Path to tiny-imagenet-200 root directory")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
+    parser.add_argument("--epochs_warmup", type=int, default=5, help="Classifier head warm-up epochs")
+    parser.add_argument("--epochs_finetune", type=int, default=20, help="Fine-tuning epochs")
+    parser.add_argument("--unfreeze_layers", type=int, default=40, help="Number of backbone layers to unfreeze")
+    parser.add_argument("--cache_to_disk", action="store_true", help="Enable on-disk dataset cache")
+    parser.add_argument("--no_cache", action="store_true", help="Disable caching entirely")
+    args = parser.parse_args()
+
+    # Resolve cache policy
+    cache_to_disk = False if args.no_cache else args.cache_to_disk
 
     # Build datasets
-    train_ds = make_train_dataset(train_dir, class_names)
-    val_ds = make_val_dataset(val_dir, class_names)
+    train_ds, val_ds, num_classes, wnids = make_datasets(
+        root_dir=args.data_root,
+        batch_size=args.batch_size,
+        image_size=(224, 224),
+        cache_to_disk=cache_to_disk,
+    )
 
-    # Compute simple dataset cardinalities (for logging only)
-    train_count = sum(int(b.shape[0]) for b, _ in train_ds.unbatch().batch(1).take(10))  # sample
-    # Full counts (exact) if needed:
-    # train_count = sum(1 for _ in train_ds.unbatch())
-    # val_count = sum(1 for _ in val_ds.unbatch())
+    # Print a short mapping summary
+    print_mapping_summary(wnids, limit=10)
 
-    # Build model
-    model = build_model(num_classes)
+    # Construct model
+    model, base = build_model(num_classes)
 
-    # -----------------------------
-    # Warm-up: train head only
-    # -----------------------------
-    head_opt = keras.optimizers.Adam(learning_rate=1e-3)
+    # ---------------- Warm-up: train classifier head only ----------------
+    base.trainable = False
     model.compile(
-        optimizer=head_opt,
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
         loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
 
-    print(f"[warm-up] trainable params: {count_trainable_params(model):,}")
-    warmup_callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            filepath=str(CKPT_DIR / "best_warmup.keras"),
-            monitor="val_accuracy",
-            mode="max",
-            save_best_only=True,
-            save_weights_only=False,
-        ),
-        keras.callbacks.CSVLogger(str(CKPT_DIR / "warmup_log.csv"), append=False),
-    ]
-
+    # Compute safe steps (avoid partial last batch for stability)
+    train_steps = tf.data.experimental.cardinality(train_ds).numpy()
+    val_steps = tf.data.experimental.cardinality(val_ds).numpy()
+    print(f"[warm-up] trainable params: {model.trainable_weights and sum(int(tf.size(v)) for v in model.trainable_variables)}")
     model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=WARMUP_EPOCHS,
-        callbacks=warmup_callbacks,
+        epochs=args.epochs_warmup,
+        steps_per_epoch=train_steps,
+        validation_steps=val_steps,
         verbose=2,
     )
 
-    # -----------------------------
-    # Fine-tune: unfreeze top blocks
-    # -----------------------------
-    # Locate backbone submodel and unfreeze top layers (keep BN frozen)
-    backbone = None
-    for layer in model.layers:
-        if isinstance(layer, keras.Model) and layer.name.startswith("mobilenetv2"):
-            backbone = layer
-            break
-    assert backbone is not None, "Backbone not found in model graph."
-
-    set_backbone_trainable(backbone, UNFREEZE_TOP_N_LAYERS)
-
-    # Recompile with a lower LR and training=True for the backbone
-    ft_opt = keras.optimizers.Adam(learning_rate=1e-4)
+    # ---------------- Fine-tuning: unfreeze tail ----------------
+    unfreeze_tail(base, num_unfrozen=args.unfreeze_layers)
+    # Compile with a lower LR; freeze BatchNorms implicitly respected
     model.compile(
-        optimizer=ft_opt,
+        optimizer=keras.optimizers.Adam(learning_rate=1e-4),
         loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
-    print(f"[fine-tune] trainable params: {count_trainable_params(model):,}")
 
+    # Callbacks: learning rate scheduling, early stop, checkpointing
+    ckpt_dir = Path("checkpoints/tiny_mobilenetv2_full")
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     callbacks = [
         keras.callbacks.ModelCheckpoint(
-            filepath=str(CKPT_DIR / "best.keras"),
+            filepath=str(ckpt_dir / "best.keras"),
             monitor="val_accuracy",
-            mode="max",
             save_best_only=True,
             save_weights_only=False,
         ),
-        keras.callbacks.ModelCheckpoint(
-            filepath=str(CKPT_DIR / "final.keras"),
-            monitor="val_accuracy",
-            mode="max",
-            save_best_only=False,
-            save_weights_only=False,
-        ),
         keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=5e-6, verbose=1
+            monitor="val_loss",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1,
         ),
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=5, restore_best_weights=True, verbose=1
+            monitor="val_loss",
+            patience=7,
+            restore_best_weights=True,
+            verbose=1,
         ),
-        keras.callbacks.CSVLogger(str(CKPT_DIR / "finetune_log.csv"), append=False),
-        keras.callbacks.TerminateOnNaN(),
     ]
+
+    print(f"[fine-tune] unfreezing last {args.unfreeze_layers} backbone layers (BatchNorm frozen).")
+    # Simple indicator of how many params will update
+    trainable_params = sum(v.numpy().size for v in model.trainable_variables)
+    print(f"[diag] trainables (fine-tune): {trainable_params:,} params")
 
     history = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=FINETUNE_EPOCHS,
+        epochs=args.epochs_finetune,
+        steps_per_epoch=train_steps,
+        validation_steps=val_steps,
         callbacks=callbacks,
         verbose=2,
     )
 
-    # -----------------------------
-    # Save artifacts
-    # -----------------------------
-    model.save(str(CKPT_DIR / "final.keras"))
-    print("\n✅ Training complete. Saved:")
-    print(f"  - {CKPT_DIR / 'best.keras'}")
-    print(f"  - {CKPT_DIR / 'final.keras'}")
-    print(f"  - Logs: {CKPT_DIR / 'warmup_log.csv'} , {CKPT_DIR / 'finetune_log.csv'}")
+    # Save final model
+    final_path = ckpt_dir / "final.keras"
+    model.save(final_path)
+
+    # Quick distribution checks to ensure outputs are non-degenerate
+    quick_distribution_check(model, val_ds, name="VAL", steps=3)
+    quick_distribution_check(model, train_ds, name="TRAIN", steps=3)
+
+    # Final evaluation summary
+    eval_train = model.evaluate(train_ds, verbose=0)
+    eval_val = model.evaluate(val_ds, verbose=0)
+    print(f"\nEVAL — train: acc={eval_train[1]:.3f}, val: acc={eval_val[1]:.3f}\n")
+    print(f"✅ Training finished. Saved:\n  - {ckpt_dir / 'best.keras'}\n  - {final_path}\n")
 
 
 if __name__ == "__main__":
-    # Environment tweak: ensure TF does not pre-allocate all GPU memory.
-    os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
     main()
