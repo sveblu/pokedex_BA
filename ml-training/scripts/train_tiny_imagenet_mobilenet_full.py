@@ -9,7 +9,7 @@ Key characteristics
 - Validation labels constructed from val_annotations.txt.
 - No in-memory dataset cache (prevents host-pinned OOM); optional on-disk cache.
 - Two-stage training: classifier head warm-up, then partial backbone fine-tuning.
-- Conservative defaults for 6 GB GPUs; configurable via CLI flags.
+- Conservative defaults for ~6 GB GPUs; configurable via CLI flags.
 
 Directory layout expected (standard Tiny-ImageNet):
   <root>/
@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 import tensorflow as tf
 from tensorflow import keras
@@ -32,30 +32,44 @@ from tensorflow import keras
 # ----------------------------- Runtime configuration -----------------------------
 
 # Disable XLA to avoid large host-pinned buffers during data ingest.
-# It can be re-enabled later once the pipeline is stable.
 tf.config.optimizer.set_jit(False)
 
 # Enable dynamic GPU memory growth for WSL / consumer GPUs.
-gpus = tf.config.list_physical_devices("GPU")
-for g in gpus:
+for g in tf.config.list_physical_devices("GPU"):
     try:
         tf.config.experimental.set_memory_growth(g, True)
     except Exception:
-        pass  # Fallback silently if not supported
+        pass
 
 AUTOTUNE = tf.data.AUTOTUNE
 
 
+# ----------------------------- Utilities ----------------------------------------
+
+def count_trainable_params(model: keras.Model) -> int:
+    """Returns the number of trainable scalar parameters."""
+    total = 0
+    for v in model.trainable_variables:
+        # Using .shape avoids materializing tensor values.
+        n = 1
+        for d in v.shape:
+            n *= int(d) if d is not None else 1
+        total += int(n)
+    return total
+
+
 # ----------------------------- Data pipeline ------------------------------------
 
-def build_lookup_tables(root: Path) -> Tuple[tf.lookup.StaticHashTable, tf.lookup.StaticHashTable, list[str]]:
+def build_lookup_tables(root: Path) -> Tuple[tf.lookup.StaticHashTable, tf.lookup.StaticHashTable, List[str]]:
     """
     Builds two lookup tables:
       - wnid_to_index: maps WNID string -> class index [0..C-1]
       - valfile_to_index: maps validation filename (e.g., 'val_0.JPEG') -> class index
     Returns both tables and the ordered list of WNIDs.
     """
-    wnids = [w.strip() for w in (root / "wnids.txt").read_text().splitlines() if w.strip()]
+    wnids_path = root / "wnids.txt"
+    assert wnids_path.exists(), f"Missing: {wnids_path}"
+    wnids = [w.strip() for w in wnids_path.read_text().splitlines() if w.strip()]
     assert len(wnids) > 0, "wnids.txt is empty or missing classes."
 
     # WNID -> integer index
@@ -91,12 +105,12 @@ def make_datasets(
     batch_size: int = 32,
     image_size: tuple[int, int] = (224, 224),
     cache_to_disk: bool = True,
-) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, list[str]]:
+) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, List[str]]:
     """
     Creates memory-safe tf.data pipelines for train and validation.
 
     Design decisions
-    - No in-memory `Dataset.cache()` to avoid large host-pinned allocations.
+    - No in-memory `Dataset.cache()` to avoid host-pinned allocations.
     - Optional on-disk cache at ~/.tfdata_cache/tiny-imagenet-200/*.cache.
     - Fixed class indices via wnids.txt; validation labels from val_annotations.txt.
     """
@@ -112,15 +126,15 @@ def make_datasets(
     wnid_to_index, valfile_to_index, wnids = build_lookup_tables(root)
     num_classes = len(wnids)
 
-    # Decoder and basic preprocessing
     def _decode_and_resize(img_bytes: tf.Tensor) -> tf.Tensor:
+        """Decodes JPEG and resizes to the configured resolution."""
         img = tf.image.decode_jpeg(img_bytes, channels=3)
         img = tf.image.resize(img, image_size, antialias=True)
         img = tf.cast(img, tf.float32) / 255.0
         return img
 
-    # Train: derive label from directory name (.../train/<WNID>/images/<file>)
-    def _load_train(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    def _load_train(path: tf.Tensor):
+        """Loads a training sample and infers the label from the WNID directory."""
         img_bytes = tf.io.read_file(path)
         img = _decode_and_resize(img_bytes)
         parts = tf.strings.split(path, os.sep)
@@ -128,19 +142,19 @@ def make_datasets(
         label = wnid_to_index.lookup(wnid)
         return img, label
 
-    # Val: derive label from filename using val_annotations mapping
-    def _load_val(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    def _load_val(path: tf.Tensor):
+        """Loads a validation sample and maps filename to its class index."""
         img_bytes = tf.io.read_file(path)
         img = _decode_and_resize(img_bytes)
         fname = tf.strings.split(path, os.sep)[-1]
         label = valfile_to_index.lookup(fname)
         return img, label
 
-    # Lists of files
+    # Enumerate files
     train_files = tf.data.Dataset.list_files(str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True)
     val_files = tf.data.Dataset.list_files(str(val_img_dir / "*.JPEG"), shuffle=False)
 
-    # Augmentations (lightweight; compatible with validation pipeline)
+    # Lightweight augmentations
     aug = keras.Sequential(
         [
             keras.layers.RandomFlip("horizontal"),
@@ -150,7 +164,7 @@ def make_datasets(
         name="augment",
     )
 
-    def _map_train(path: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+    def _map_train(path: tf.Tensor):
         img, label = _load_train(path)
         img = aug(img)
         return img, label
@@ -170,7 +184,7 @@ def make_datasets(
         .prefetch(2)
     )
 
-    # Optional: on-disk cache (safe). Speeds up subsequent epochs without consuming RAM.
+    # Optional: on-disk cache (safe)
     if cache_to_disk:
         cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200"
         cache_root.mkdir(parents=True, exist_ok=True)
@@ -182,9 +196,10 @@ def make_datasets(
 
 # ----------------------------- Model definition ---------------------------------
 
-def build_model(num_classes: int) -> keras.Model:
+def build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
     """
-    Constructs MobileNetV2 backbone with a classifier head.
+    Constructs a MobileNetV2 backbone with a classifier head.
+    BatchNormalization layers are kept in inference mode during warm-up.
     """
     base = keras.applications.MobileNetV2(
         input_shape=(224, 224, 3),
@@ -192,7 +207,7 @@ def build_model(num_classes: int) -> keras.Model:
         weights="imagenet",
     )
     x = keras.Input(shape=(224, 224, 3))
-    y = base(x, training=False)  # frozen batchnorm statistics during warm-up
+    y = base(x, training=False)  # BN statistics frozen during warm-up
     y = keras.layers.GlobalAveragePooling2D()(y)
     y = keras.layers.Dropout(0.2)(y)
     out = keras.layers.Dense(num_classes, activation="softmax")(y)
@@ -200,16 +215,13 @@ def build_model(num_classes: int) -> keras.Model:
     return model, base
 
 
-def unfreeze_tail(base: keras.Model, num_unfrozen: int = 40) -> None:
+def unfreeze_tail(base: keras.Model, num_unfrozen: int) -> None:
     """
     Unfreezes the last `num_unfrozen` layers of `base` for fine-tuning, while keeping
     BatchNormalization layers frozen to preserve stable statistics.
     """
-    # Freeze all first
     for layer in base.layers:
         layer.trainable = False
-
-    # Unfreeze tail except BatchNorm
     for layer in base.layers[-num_unfrozen:]:
         if isinstance(layer, keras.layers.BatchNormalization):
             layer.trainable = False
@@ -219,10 +231,8 @@ def unfreeze_tail(base: keras.Model, num_unfrozen: int = 40) -> None:
 
 # ----------------------------- Diagnostics --------------------------------------
 
-def print_mapping_summary(wnids: list[str], limit: int = 10) -> None:
-    """
-    Prints the first few WNIDs and their indices for sanity checking.
-    """
+def print_mapping_summary(wnids: List[str], limit: int = 10) -> None:
+    """Prints the first few WNIDs and their indices for sanity checking."""
     print("\nWNIDs (order -> class_id):")
     for i, w in enumerate(wnids[:limit]):
         print(f"  {i:<2d} -> {w}")
@@ -237,8 +247,7 @@ def quick_distribution_check(model: keras.Model, ds: tf.data.Dataset, name: str,
     outputs are non-degenerate after training.
     """
     import numpy as np
-    probs_all = []
-    preds_all = []
+    probs_all, preds_all = [], []
     for i, (xb, _) in enumerate(ds.take(steps)):
         p = model.predict(xb, verbose=0)
         probs_all.append(p)
@@ -256,13 +265,30 @@ def quick_distribution_check(model: keras.Model, ds: tf.data.Dataset, name: str,
 
 def main():
     parser = argparse.ArgumentParser(description="MobileNetV2 on Tiny-ImageNet-200 (memory-safe pipeline)")
+
+    # Data / pipeline
     parser.add_argument("--data_root", type=str, required=True, help="Path to tiny-imagenet-200 root directory")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
-    parser.add_argument("--epochs_warmup", type=int, default=5, help="Classifier head warm-up epochs")
-    parser.add_argument("--epochs_finetune", type=int, default=20, help="Fine-tuning epochs")
-    parser.add_argument("--unfreeze_layers", type=int, default=40, help="Number of backbone layers to unfreeze")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--image_size", type=int, nargs=2, default=(224, 224), metavar=("H", "W"),
+                        help="Input image size (H W)")
     parser.add_argument("--cache_to_disk", action="store_true", help="Enable on-disk dataset cache")
     parser.add_argument("--no_cache", action="store_true", help="Disable caching entirely")
+
+    # Training schedule
+    parser.add_argument("--epochs_warmup", type=int, default=5, help="Classifier head warm-up epochs")
+    parser.add_argument("--epochs_finetune", type=int, default=20, help="Fine-tuning epochs")
+
+    # Fine-tune controls (Option A)
+    parser.add_argument("--unfreeze_last", type=int, default=40, help="Number of backbone layers to unfreeze")
+    parser.add_argument("--lr_warmup", type=float, default=3e-4, help="Learning rate during warm-up")
+    parser.add_argument("--lr_finetune", type=float, default=1e-4, help="Learning rate during fine-tuning")
+    parser.add_argument("--early_stop_patience", type=int, default=7, help="EarlyStopping patience (epochs)")
+    parser.add_argument("--monitor", type=str, default="val_loss", choices=["val_loss", "val_accuracy"],
+                        help="Metric used for LR scheduling and early stopping")
+    parser.add_argument("--reduce_lr_patience", type=int, default=3, help="ReduceLROnPlateau patience")
+    parser.add_argument("--reduce_lr_factor", type=float, default=0.5, help="ReduceLROnPlateau factor")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum LR for scheduler")
+
     args = parser.parse_args()
 
     # Resolve cache policy
@@ -272,7 +298,7 @@ def main():
     train_ds, val_ds, num_classes, wnids = make_datasets(
         root_dir=args.data_root,
         batch_size=args.batch_size,
-        image_size=(224, 224),
+        image_size=tuple(args.image_size),
         cache_to_disk=cache_to_disk,
     )
 
@@ -285,15 +311,14 @@ def main():
     # ---------------- Warm-up: train classifier head only ----------------
     base.trainable = False
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        optimizer=keras.optimizers.Adam(learning_rate=args.lr_warmup),
         loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
 
-    # Compute safe steps (avoid partial last batch for stability)
     train_steps = tf.data.experimental.cardinality(train_ds).numpy()
     val_steps = tf.data.experimental.cardinality(val_ds).numpy()
-    print(f"[warm-up] trainable params: {model.trainable_weights and sum(int(tf.size(v)) for v in model.trainable_variables)}")
+    print(f"[warm-up] trainable params: {count_trainable_params(model):,}")
     model.fit(
         train_ds,
         validation_data=val_ds,
@@ -304,43 +329,43 @@ def main():
     )
 
     # ---------------- Fine-tuning: unfreeze tail ----------------
-    unfreeze_tail(base, num_unfrozen=args.unfreeze_layers)
-    # Compile with a lower LR; freeze BatchNorms implicitly respected
+    unfreeze_tail(base, num_unfrozen=args.unfreeze_last)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+        optimizer=keras.optimizers.Adam(learning_rate=args.lr_finetune),
         loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
 
-    # Callbacks: learning rate scheduling, early stop, checkpointing
     ckpt_dir = Path("checkpoints/tiny_mobilenetv2_full")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     callbacks = [
         keras.callbacks.ModelCheckpoint(
             filepath=str(ckpt_dir / "best.keras"),
-            monitor="val_accuracy",
+            monitor=args.monitor,
+            mode="max" if args.monitor == "val_accuracy" else "min",
             save_best_only=True,
             save_weights_only=False,
         ),
         keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
+            monitor=args.monitor,
+            factor=args.reduce_lr_factor,
+            patience=args.reduce_lr_patience,
+            min_lr=args.min_lr,
             verbose=1,
+            mode="max" if args.monitor == "val_accuracy" else "min",
         ),
         keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=7,
+            monitor=args.monitor,
+            patience=args.early_stop_patience,
             restore_best_weights=True,
             verbose=1,
+            mode="max" if args.monitor == "val_accuracy" else "min",
         ),
     ]
 
-    print(f"[fine-tune] unfreezing last {args.unfreeze_layers} backbone layers (BatchNorm frozen).")
-    # Simple indicator of how many params will update
-    trainable_params = sum(v.numpy().size for v in model.trainable_variables)
-    print(f"[diag] trainables (fine-tune): {trainable_params:,} params")
+    print(f"[fine-tune] unfreezing last {args.unfreeze_last} backbone layers (BatchNorm frozen).")
+    print(f"[diag] trainables (fine-tune): {count_trainable_params(model):,} params")
 
     history = model.fit(
         train_ds,
