@@ -1,15 +1,65 @@
+# -------------------------
+# ANDROID / ANDROID STUDIO
+# -------------------------
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
 local.properties
+
+# Android Studio
+.idea/
+*.apk
+*.ap_
+*.dex
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+
+# Logs
+*.log
+
+# -------------------------
+# PYTHON / MACHINE LEARNING
+# -------------------------
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model artifacts / datasets (you can adjust later)
+*.h5
+*.tflite
+*.onnx
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy
+
+# Dataset dumps
+data/
+datasets/
+
+# -------------------------
+# OS SPECIFIC
+# -------------------------
+.DS_Store
+Thumbs.db
