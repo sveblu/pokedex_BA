@@ -257,7 +257,7 @@ def main():
     parser.add_argument("--reduce_lr_factor", type=float, default=0.5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+   # parser.add_argument("--label_smoothing", type=float, default=0.1)
 
     # Logging / runs
     parser.add_argument("--run_name", type=str, default=None)
@@ -308,7 +308,7 @@ def main():
     unfreeze_tail(base, num_unfrozen=args.unfreeze_last)
     model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=args.lr_finetune, weight_decay=args.weight_decay),
-        loss=keras.losses.SparseCategoricalCrossentropy(label_smoothing=args.label_smoothing),
+        loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
 
