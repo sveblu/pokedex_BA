@@ -308,7 +308,7 @@ def main():
     unfreeze_tail(base, num_unfrozen=args.unfreeze_last)
     model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=args.lr_finetune, weight_decay=args.weight_decay),
-        loss=keras.losses.SparseCategoricalCrossentropy(label_smoothing=args.label_smoothing),
+        loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
 
