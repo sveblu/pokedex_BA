@@ -68,7 +68,10 @@ if Path(MODEL_PATH).exists() and Path(DATA_ROOT).exists():
         val_map[fname] = wnid_to_index[wnid]
 
     val_img_dir = root / "val" / "images"
+
+    #files = sorted([str(val_img_dir / f) for f in os.listdir(val_img_dir) if f.endswith(".JPEG")])
     files = sorted([str(val_img_dir / f) for f in os.listdir(val_img_dir) if f.endswith(".JPEG")])
+    labels = [val_map[os.path.basename(f)] for f in files]  # compute labels in Python
 
     def load_img(fp):
         b = tf.io.read_file(fp)
@@ -77,9 +80,11 @@ if Path(MODEL_PATH).exists() and Path(DATA_ROOT).exists():
         return tf.cast(x, tf.float32) / 255.0
 
     # build a tf.data pipeline for val
-    ds = tf.data.Dataset.from_tensor_slices(files)
-    ds = ds.map(lambda p: (load_img(p), tf.cast(val_map[Path(p).name], tf.int32)),
-                num_parallel_calls=tf.data.AUTOTUNE).batch(64).prefetch(2)
+    ds = tf.data.Dataset.from_tensor_slices((files, labels))
+    ds = ds.map(
+        lambda p, l: (load_img(p), tf.cast(l, tf.int32)),
+        num_parallel_calls=tf.data.AUTOTUNE
+    ).batch(64).prefetch(2)
 
     y_true, y_pred = [], []
     for xb, yb in ds:
