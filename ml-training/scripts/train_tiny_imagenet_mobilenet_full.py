@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-MobileNetV2 on Tiny-ImageNet-200 with a memory-safe tf.data pipeline.
-
-Key characteristics
-- Fixed class ordering from wnids.txt to ensure stable label indices.
-- Validation labels constructed from val_annotations.txt.
-- No in-memory dataset cache (prevents host-pinned OOM); optional on-disk cache.
-- Two-stage training: classifier head warm-up, then partial backbone fine-tuning.
-- Conservative defaults for ~6 GB GPUs; configurable via CLI flags.
-
-Directory layout expected (standard Tiny-ImageNet):
-  <root>/
-    wnids.txt
-    words.txt
-    train/<WNID>/images/*.JPEG
-    val/images/*.JPEG
-    val/val_annotations.txt
-"""
-
 from __future__ import annotations
 import os
 import argparse
