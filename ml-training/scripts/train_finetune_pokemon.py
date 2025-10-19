@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # train_finetune_pokemon.py
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # hide INFO & WARNING, show only ERROR
 
 import argparse, json, sys
 from pathlib import Path
