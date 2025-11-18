@@ -288,7 +288,7 @@ def main():
     ap.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
 
     ap.add_argument("--epochs_warmup", type=int, default=5)
-    ap.add_argument("--epochs_finetune", type:int, default=60)
+    ap.add_argument("--epochs_finetune", type=int, default=60)
     ap.add_argument("--unfreeze_last", type=int, default=120)
     ap.add_argument("--lr_warmup", type=float, default=3e-4)
     ap.add_argument("--lr_finetune", type=float, default=1e-4)
