@@ -101,36 +101,42 @@ def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.
     return img
 
 
-def rotate_image(img: tf.Tensor, radians: float) -> tf.Tensor:
-    """Rotate around image center using ImageProjectiveTransformV3."""
-    h = tf.cast(tf.shape(img)[0], tf.float32)
-    w = tf.cast(tf.shape(img)[1], tf.float32)
+def rotate_image(img, radians):
+    img_shape = tf.shape(img)
+    h = tf.cast(img_shape[0], tf.float32)
+    w = tf.cast(img_shape[1], tf.float32)
+
     cx = w / 2.0
     cy = h / 2.0
 
-    c = tf.math.cos(radians)
-    s = tf.math.sin(radians)
+    cos_a = tf.math.cos(radians)
+    sin_a = tf.math.sin(radians)
 
-    # mapping from output coords to input coords
-    a0 = c
-    a1 = -s
-    a2 = cx * (1.0 - c) + cy * s
-    b0 = s
-    b1 = c
-    b2 = cy * (1.0 - c) - cx * s
+    # Build transform: maps output -> input coordinates
+    # [a0, a1, a2, a3, a4, a5, a6, a7]
+    # x_in = a0 * x_out + a1 * y_out + a2
+    # y_in = a3 * x_out + a4 * y_out + a5
+    tx = cx - cos_a * cx + sin_a * cy
+    ty = cy - sin_a * cx - cos_a * cy
 
-    transform = tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0])
-    transform = tf.expand_dims(transform, 0)
+    transform = tf.stack([cos_a, -sin_a, tx,
+                          sin_a,  cos_a, ty,
+                          0.0,    0.0])
+    transform = tf.reshape(transform, (1, 8))
 
     img_b = tf.expand_dims(img, 0)
+
     out = tf.raw_ops.ImageProjectiveTransformV3(
         images=img_b,
         transforms=transform,
         output_shape=tf.cast(tf.shape(img)[:2], tf.int32),
         interpolation="BILINEAR",
         fill_mode="REFLECT",
+        fill_value=0.0,          # 👈 this is the missing argument
     )
-    return out[0]
+
+    return tf.squeeze(out, 0)
+
 
 
 def blur_image(img: tf.Tensor) -> tf.Tensor:
