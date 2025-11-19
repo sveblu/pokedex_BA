@@ -207,7 +207,7 @@ def make_datasets(
         flip = tf.image.flip_left_right(img)
         rot_p = rotate_image(img, RAD_45)
         rot_m = rotate_image(img, -RAD_45)
-        zoom_blur = blur_image(zoom_image(img))
+        zoom_blur = blur_image((img))
 
         imgs = tf.stack([img, flip, rot_p, rot_m, zoom_blur], axis=0)
         labels = tf.fill([5], label)
