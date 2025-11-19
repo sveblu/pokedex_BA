@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MobileNetV2 pretraining on Tiny-ImageNet-200 with *deterministic* augmentations:
-- original image
-- horizontal flip
-- +45° rotation
-- -45° rotation
-- zoom + blur
+MobileNetV2 pretraining on Tiny-ImageNet-200 with on-the-fly augmentations:
+- random horizontal flip
+- random rotation in [-45°, +45°]
+- random zoom (central crop + resize)
+- random light blur
 
-Each training file produces 5 samples.
+Augmentations are applied every epoch, per image, so the model never sees
+exactly the same batch twice.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def build_lookup_tables(
 
 
 # -------------------------------------------------------------------
-# Augmentation primitives (pure TF, no addons)
+# Augmentation primitives (pure TF)
 # -------------------------------------------------------------------
 
 RAD_45 = math.pi / 4.0
@@ -101,7 +101,7 @@ def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.
     return img
 
 
-def rotate_image(img, radians):
+def rotate_image(img: tf.Tensor, radians: tf.Tensor) -> tf.Tensor:
     img_shape = tf.shape(img)
     h = tf.cast(img_shape[0], tf.float32)
     w = tf.cast(img_shape[1], tf.float32)
@@ -112,16 +112,14 @@ def rotate_image(img, radians):
     cos_a = tf.math.cos(radians)
     sin_a = tf.math.sin(radians)
 
-    # Build transform: maps output -> input coordinates
-    # [a0, a1, a2, a3, a4, a5, a6, a7]
-    # x_in = a0 * x_out + a1 * y_out + a2
-    # y_in = a3 * x_out + a4 * y_out + a5
     tx = cx - cos_a * cx + sin_a * cy
     ty = cy - sin_a * cx - cos_a * cy
 
-    transform = tf.stack([cos_a, -sin_a, tx,
-                          sin_a,  cos_a, ty,
-                          0.0,    0.0])
+    transform = tf.stack(
+        [cos_a, -sin_a, tx,
+         sin_a,  cos_a, ty,
+         0.0,    0.0]
+    )
     transform = tf.reshape(transform, (1, 8))
 
     img_b = tf.expand_dims(img, 0)
@@ -132,15 +130,13 @@ def rotate_image(img, radians):
         output_shape=tf.cast(tf.shape(img)[:2], tf.int32),
         interpolation="BILINEAR",
         fill_mode="REFLECT",
-        fill_value=0.0,          # 👈 this is the missing argument
+        fill_value=0.0,
     )
 
     return tf.squeeze(out, 0)
 
 
-
 def blur_image(img: tf.Tensor) -> tf.Tensor:
-    """Simple 3x3 Gaussian-ish blur."""
     kernel = tf.constant(
         [[1, 2, 1],
          [2, 4, 2],
@@ -151,14 +147,16 @@ def blur_image(img: tf.Tensor) -> tf.Tensor:
     kernel = tf.reshape(kernel, [3, 3, 1, 1])
 
     img_b = tf.expand_dims(img, 0)
-    # apply same kernel to all channels
     img_blur = tf.nn.depthwise_conv2d(
-        img_b, tf.tile(kernel, [1, 1, 3, 1]), strides=[1, 1, 1, 1], padding="SAME"
+        img_b,
+        tf.tile(kernel, [1, 1, 3, 1]),
+        strides=[1, 1, 1, 1],
+        padding="SAME",
     )
     return img_blur[0]
 
 
-def zoom_image(img: tf.Tensor, central_fraction: float = 0.8) -> tf.Tensor:
+def zoom_image(img: tf.Tensor, central_fraction: tf.Tensor) -> tf.Tensor:
     h = tf.shape(img)[0]
     w = tf.shape(img)[1]
     cropped = tf.image.central_crop(img, central_fraction=central_fraction)
@@ -166,8 +164,34 @@ def zoom_image(img: tf.Tensor, central_fraction: float = 0.8) -> tf.Tensor:
     return cropped
 
 
+def random_augment(img: tf.Tensor) -> tf.Tensor:
+    # random horizontal flip
+    img = tf.cond(
+        tf.random.uniform(()) < 0.5,
+        lambda: tf.image.flip_left_right(img),
+        lambda: img,
+    )
+
+    # random rotation in [-45°, +45°]
+    angle = tf.random.uniform((), minval=-RAD_45, maxval=RAD_45)
+    img = rotate_image(img, angle)
+
+    # random zoom: central crop between 70% and 100%
+    cf = tf.random.uniform((), minval=0.7, maxval=1.0)
+    img = zoom_image(img, cf)
+
+    # random blur with small probability
+    img = tf.cond(
+        tf.random.uniform(()) < 0.3,
+        lambda: blur_image(img),
+        lambda: img,
+    )
+
+    return img
+
+
 # -------------------------------------------------------------------
-# Dataset construction (with deterministic augmentations)
+# Dataset construction (on-the-fly augmentations)
 # -------------------------------------------------------------------
 
 def make_datasets(
@@ -191,6 +215,7 @@ def make_datasets(
         parts = tf.strings.split(path, os.sep)
         wnid = parts[-3]
         label = wnid_to_index.lookup(wnid)
+        img = random_augment(img)
         return img, label
 
     def _load_val(path: tf.Tensor):
@@ -200,20 +225,6 @@ def make_datasets(
         label = valfile_to_index.lookup(fname)
         return img, label
 
-    # one path -> Dataset of 5 augmented images with same label
-    def _augment_from_path(path: tf.Tensor) -> tf.data.Dataset:
-        img, label = _load_train(path)
-
-        flip = tf.image.flip_left_right(img)
-        rot_p = rotate_image(img, RAD_45)
-        rot_m = rotate_image(img, -RAD_45)
-        zoom_blur = blur_image((img))
-
-        imgs = tf.stack([img, flip, rot_p, rot_m, zoom_blur], axis=0)
-        labels = tf.fill([5], label)
-        return tf.data.Dataset.from_tensor_slices((imgs, labels))
-
-    # list_files for train and val
     train_files = tf.data.Dataset.list_files(
         str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True
     )
@@ -221,16 +232,14 @@ def make_datasets(
         str(val_img_dir / "*.JPEG"), shuffle=False
     )
 
-    # train: flat_map to materialize 5 augmented samples per file
     train_ds = (
         train_files
-        .flat_map(_augment_from_path)
         .shuffle(2000)
+        .map(_load_train, num_parallel_calls=AUTOTUNE)
         .batch(batch_size, drop_remainder=True)
         .prefetch(AUTOTUNE)
     )
 
-    # val: no augmentation
     val_ds = (
         val_files
         .map(_load_val, num_parallel_calls=AUTOTUNE)
@@ -285,7 +294,7 @@ def print_mapping_summary(wnids: List[str], limit: int = 10) -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="MobileNetV2 on Tiny-ImageNet-200 with handcrafted augmentations"
+        description="MobileNetV2 on Tiny-ImageNet-200 with random handcrafted augmentations"
     )
     ap.add_argument("--data_root", required=True, help="tiny-imagenet-200 root")
     ap.add_argument("--run_name", default="tinyimagenet_aug")
@@ -342,7 +351,7 @@ def main():
     val_steps = tf.data.experimental.cardinality(val_ds).numpy()
 
     print(f"[warm-up] trainable params: {count_trainable_params(model):,}")
-    warm_hist = model.fit(
+    model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=args.epochs_warmup,
@@ -393,7 +402,7 @@ def main():
     print(f"[fine-tune] unfreezing last {args.unfreeze_last} backbone layers (BN frozen)")
     print(f"[diag] trainables (fine-tune): {count_trainable_params(model):,}")
 
-    fine_hist = model.fit(
+    model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=args.epochs_finetune,
@@ -409,8 +418,13 @@ def main():
     eval_train = model.evaluate(train_ds, verbose=0)
     eval_val = model.evaluate(val_ds, verbose=0)
     print(f"\nEVAL — train: acc={eval_train[1]:.3f}, val: acc={eval_val[1]:.3f}\n")
-    print(f"Saved to:\n  - {ckpt_dir / 'best.keras'}\n  - {final_path}\n"
-          f"  - {run_dir / 'warmup_history.csv'}\n  - {run_dir / 'finetune_history.csv'}\n")
+    print(
+        "Saved to:\n"
+        f"  - {ckpt_dir / 'best.keras'}\n"
+        f"  - {final_path}\n"
+        f"  - {run_dir / 'warmup_history.csv'}\n"
+        f"  - {run_dir / 'finetune_history.csv'}\n"
+    )
 
 
 if __name__ == "__main__":
