@@ -4,11 +4,13 @@
 MobileNetV2 pretraining on Tiny-ImageNet-200 with on-the-fly augmentations:
 - random horizontal flip
 - random rotation in [-45°, +45°]
-- random zoom (central crop + resize)
-- random light blur
+- random light blur (with some probability)
 
 Augmentations are applied every epoch, per image, so the model never sees
 exactly the same batch twice.
+
+Optionally, decoded+resized images are cached on disk (before augmentation)
+to speed up later epochs.
 """
 
 from __future__ import annotations
@@ -156,14 +158,6 @@ def blur_image(img: tf.Tensor) -> tf.Tensor:
     return img_blur[0]
 
 
-def zoom_image(img: tf.Tensor, central_fraction: tf.Tensor) -> tf.Tensor:
-    h = tf.shape(img)[0]
-    w = tf.shape(img)[1]
-    cropped = tf.image.central_crop(img, central_fraction=central_fraction)
-    cropped = tf.image.resize(cropped, (h, w), antialias=True)
-    return cropped
-
-
 def random_augment(img: tf.Tensor) -> tf.Tensor:
     # random horizontal flip
     img = tf.cond(
@@ -176,10 +170,6 @@ def random_augment(img: tf.Tensor) -> tf.Tensor:
     angle = tf.random.uniform((), minval=-RAD_45, maxval=RAD_45)
     img = rotate_image(img, angle)
 
-    # random zoom: central crop between 70% and 100%
-    cf = tf.random.uniform((), minval=0.7, maxval=1.0)
-    img = zoom_image(img, cf)
-
     # random blur with small probability
     img = tf.cond(
         tf.random.uniform(()) < 0.3,
@@ -191,13 +181,14 @@ def random_augment(img: tf.Tensor) -> tf.Tensor:
 
 
 # -------------------------------------------------------------------
-# Dataset construction (on-the-fly augmentations)
+# Dataset construction (with optional caching)
 # -------------------------------------------------------------------
 
 def make_datasets(
     root_dir: str,
     batch_size: int = 32,
     image_size: tuple[int, int] = (224, 224),
+    cache_to_disk: bool = False,
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, List[str]]:
     root = Path(root_dir)
     train_dir = root / "train"
@@ -209,12 +200,15 @@ def make_datasets(
     wnid_to_index, valfile_to_index, wnids = build_lookup_tables(root)
     num_classes = len(wnids)
 
-    def _load_train(path: tf.Tensor):
+    def _decode_train(path: tf.Tensor):
         img_bytes = tf.io.read_file(path)
         img = _decode_and_resize(img_bytes, image_size)
         parts = tf.strings.split(path, os.sep)
         wnid = parts[-3]
         label = wnid_to_index.lookup(wnid)
+        return img, label
+
+    def _augment_train(img: tf.Tensor, label: tf.Tensor):
         img = random_augment(img)
         return img, label
 
@@ -232,17 +226,32 @@ def make_datasets(
         str(val_img_dir / "*.JPEG"), shuffle=False
     )
 
+    # ---- TRAIN DATASET ----
+    train_ds = train_files.map(_decode_train, num_parallel_calls=AUTOTUNE)
+
+    if cache_to_disk:
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-randaug"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        train_ds = train_ds.cache(str(cache_root / "train_decoded.cache"))
+
     train_ds = (
-        train_files
+        train_ds
         .shuffle(2000)
-        .map(_load_train, num_parallel_calls=AUTOTUNE)
+        .map(_augment_train, num_parallel_calls=AUTOTUNE)
         .batch(batch_size, drop_remainder=True)
         .prefetch(AUTOTUNE)
     )
 
+    # ---- VAL DATASET (no augmentation) ----
+    val_ds = val_files.map(_load_val, num_parallel_calls=AUTOTUNE)
+
+    if cache_to_disk:
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-randaug"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        val_ds = val_ds.cache(str(cache_root / "val_decoded.cache"))
+
     val_ds = (
-        val_files
-        .map(_load_val, num_parallel_calls=AUTOTUNE)
+        val_ds
         .batch(batch_size, drop_remainder=False)
         .prefetch(AUTOTUNE)
     )
@@ -320,6 +329,13 @@ def main():
     ap.add_argument("--reduce_lr_factor", type=float, default=0.5)
     ap.add_argument("--min_lr", type=float, default=1e-6)
 
+    # new flag: optional disk cache (after decode, before random aug)
+    ap.add_argument(
+        "--cache_to_disk",
+        action="store_true",
+        help="Cache decoded train/val images to disk before random augmentation.",
+    )
+
     args = ap.parse_args()
 
     image_size = tuple(args.image_size)
@@ -333,6 +349,7 @@ def main():
         root_dir=args.data_root,
         batch_size=args.batch_size,
         image_size=image_size,
+        cache_to_disk=args.cache_to_disk,
     )
 
     print_mapping_summary(wnids)
@@ -389,13 +406,7 @@ def main():
             verbose=1,
             mode=monitor_mode,
         ),
-        #keras.callbacks.EarlyStopping(
-        #    monitor=args.monitor,
-        #    patience=args.early_stop_patience,
-        #    restore_best_weights=True,
-        #    verbose=1,
-        #    mode=monitor_mode,
-        #),
+        # EarlyStopping removed so it always runs full epochs_finetune
         keras.callbacks.CSVLogger(str(run_dir / "finetune_history.csv")),
     ]
 
