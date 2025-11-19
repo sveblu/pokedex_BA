@@ -225,7 +225,7 @@ def make_datasets(
     train_ds = (
         train_files
         .flat_map(_augment_from_path)
-        .shuffle(20_000)
+        .shuffle(4_000)
         .batch(batch_size, drop_remainder=True)
         .prefetch(AUTOTUNE)
     )
