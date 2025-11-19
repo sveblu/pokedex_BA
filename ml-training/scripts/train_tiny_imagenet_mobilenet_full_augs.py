@@ -389,13 +389,13 @@ def main():
             verbose=1,
             mode=monitor_mode,
         ),
-        keras.callbacks.EarlyStopping(
-            monitor=args.monitor,
-            patience=args.early_stop_patience,
-            restore_best_weights=True,
-            verbose=1,
-            mode=monitor_mode,
-        ),
+        #keras.callbacks.EarlyStopping(
+        #    monitor=args.monitor,
+        #    patience=args.early_stop_patience,
+        #    restore_best_weights=True,
+        #    verbose=1,
+        #    mode=monitor_mode,
+        #),
         keras.callbacks.CSVLogger(str(run_dir / "finetune_history.csv")),
     ]
 
