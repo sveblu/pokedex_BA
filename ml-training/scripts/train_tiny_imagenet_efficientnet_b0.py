@@ -10,6 +10,10 @@ from typing import Tuple, List
 import tensorflow as tf
 from tensorflow import keras
 
+# -------------------------------------------------------------------
+# Runtime configuration
+# -------------------------------------------------------------------
+
 tf.config.optimizer.set_jit(False)
 
 for g in tf.config.list_physical_devices("GPU"):
@@ -21,6 +25,10 @@ for g in tf.config.list_physical_devices("GPU"):
 AUTOTUNE = tf.data.AUTOTUNE
 
 
+# -------------------------------------------------------------------
+# Small helpers
+# -------------------------------------------------------------------
+
 def count_trainable_params(model: keras.Model) -> int:
     total = 0
     for v in model.trainable_variables:
@@ -30,6 +38,10 @@ def count_trainable_params(model: keras.Model) -> int:
         total += int(n)
     return int(total)
 
+
+# -------------------------------------------------------------------
+# Label lookup tables (same logic as working MobileNet script)
+# -------------------------------------------------------------------
 
 def build_lookup_tables(
     root: Path,
@@ -63,6 +75,10 @@ def build_lookup_tables(
 
     return wnid_to_index, valfile_to_index, wnids
 
+
+# -------------------------------------------------------------------
+# Dataset construction (no aug, optional cache to disk)
+# -------------------------------------------------------------------
 
 def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.Tensor:
     img = tf.image.decode_jpeg(img_bytes, channels=3)
@@ -103,38 +119,38 @@ def make_datasets(
         return img, label
 
     train_files = tf.data.Dataset.list_files(
-        str(train_dir / "*" / "images" / "*.JPEG"),
-        shuffle=True,
+        str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True
     )
     val_files = tf.data.Dataset.list_files(
-        str(val_img_dir / "*.JPEG"),
-        shuffle=False,
+        str(val_img_dir / "*.JPEG"), shuffle=False
     )
 
-    train_ds = train_files.map(_load_train, num_parallel_calls=AUTOTUNE)
-    val_ds = val_files.map(_load_val, num_parallel_calls=AUTOTUNE)
+    train_ds = (
+        train_files
+        .shuffle(20_000)
+        .map(_load_train, num_parallel_calls=AUTOTUNE)
+        .batch(batch_size, drop_remainder=True)
+        .prefetch(2)
+    )
+    val_ds = (
+        val_files
+        .map(_load_val, num_parallel_calls=AUTOTUNE)
+        .batch(batch_size, drop_remainder=False)
+        .prefetch(2)
+    )
 
     if cache_to_disk:
-        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-efnet-noaug"
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-efficientnet"
         cache_root.mkdir(parents=True, exist_ok=True)
         train_ds = train_ds.cache(str(cache_root / "train.cache"))
         val_ds = val_ds.cache(str(cache_root / "val.cache"))
 
-    train_ds = (
-        train_ds
-        .shuffle(2000)
-        .batch(batch_size, drop_remainder=True)
-        .prefetch(AUTOTUNE)
-    )
-
-    val_ds = (
-        val_ds
-        .batch(batch_size, drop_remainder=False)
-        .prefetch(AUTOTUNE)
-    )
-
     return train_ds, val_ds, num_classes, wnids
 
+
+# -------------------------------------------------------------------
+# Model
+# -------------------------------------------------------------------
 
 def build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
     base = keras.applications.EfficientNetB0(
@@ -143,9 +159,9 @@ def build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
         weights="imagenet",
     )
     inp = keras.Input(shape=(224, 224, 3))
-    x = base(inp, training=False)
+    x = base(inp, training=False)          # BN in inference mode during warm-up
     x = keras.layers.GlobalAveragePooling2D()(x)
-    x = keras.layers.Dropout(0.3)(x)
+    x = keras.layers.Dropout(0.2)(x)
     out = keras.layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(inp, out, name="efficientnetb0_tiny_imagenet")
     return model, base
@@ -170,13 +186,16 @@ def print_mapping_summary(wnids: List[str], limit: int = 10) -> None:
     print(f"\nClasses detected: {len(wnids)}\n")
 
 
+# -------------------------------------------------------------------
+# Training
+# -------------------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser(
         description="EfficientNetB0 on Tiny-ImageNet-200 (no augmentation)",
     )
     ap.add_argument("--data_root", required=True, help="tiny-imagenet-200 root")
-    ap.add_argument("--run_name", default="tinyimagenet_efnetb0")
-
+    ap.add_argument("--run_name", default="tinyimagenet_efficientnet_b0")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--image_size", type=int, nargs=2, default=(224, 224))
 
@@ -186,9 +205,8 @@ def main():
     ap.add_argument("--lr_warmup", type=float, default=3e-4)
     ap.add_argument("--lr_finetune", type=float, default=1e-4)
 
-    ap.add_argument("--cache_to_disk", action="store_true")
-    ap.add_argument("--no_cache", action="store_true")
-
+    ap.add_argument("--no_cache", action="store_true",
+                    help="Disable on-disk caching")
     ap.add_argument(
         "--monitor",
         type=str,
@@ -201,8 +219,7 @@ def main():
 
     args = ap.parse_args()
     image_size = tuple(args.image_size)
-
-    use_disk_cache = False if args.no_cache else args.cache_to_disk
+    cache_to_disk = not args.no_cache
 
     run_dir = Path("runs") / args.run_name
     ckpt_dir = run_dir / "checkpoints"
@@ -213,13 +230,14 @@ def main():
         root_dir=args.data_root,
         batch_size=args.batch_size,
         image_size=image_size,
-        cache_to_disk=use_disk_cache,
+        cache_to_disk=cache_to_disk,
     )
 
     print_mapping_summary(wnids)
 
     model, base = build_model(num_classes)
 
+    # ---------------- warm-up (head only) ----------------
     base.trainable = False
     model.compile(
         optimizer=keras.optimizers.Adam(args.lr_warmup),
@@ -243,6 +261,7 @@ def main():
         ],
     )
 
+    # ---------------- fine-tune tail ----------------
     unfreeze_tail(base, args.unfreeze_last)
     model.compile(
         optimizer=keras.optimizers.Adam(args.lr_finetune),
