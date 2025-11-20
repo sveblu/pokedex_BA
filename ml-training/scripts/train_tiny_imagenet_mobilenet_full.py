@@ -289,13 +289,6 @@ def main():
             verbose=1,
             mode="max" if args.monitor == "val_accuracy" else "min",
         ),
-        keras.callbacks.EarlyStopping(
-            monitor=args.monitor,
-            patience=args.early_stop_patience,
-            restore_best_weights=True,
-            verbose=1,
-            mode="max" if args.monitor == "val_accuracy" else "min",
-        ),
         keras.callbacks.CSVLogger(str(out_dir / "finetune_history.csv"), append=False),
     ]
 
