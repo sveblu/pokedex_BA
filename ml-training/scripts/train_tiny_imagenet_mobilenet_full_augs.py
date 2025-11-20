@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MobileNetV2 pretraining on Tiny-ImageNet-200 with on-the-fly augmentations:
-- random horizontal flip
-- random rotation in [-45°, +45°]
-- random light blur (with some probability)
+MobileNetV2 pretraining on Tiny-ImageNet-200 with on-the-fly Keras augmentations:
+
+- Random horizontal flip
+- Random rotation in approx. [-45°, +45°]
+- Random zoom-in (central crop + resize back)
 
 Augmentations are applied every epoch, per image, so the model never sees
 exactly the same batch twice.
 
-Optionally, decoded+resized images are cached on disk (before augmentation)
-to speed up later epochs.
+Supports optional on-disk caching of *decoded* images to speed up later epochs.
 """
 
 from __future__ import annotations
 import os
-import math
 import argparse
 from pathlib import Path
 from typing import Tuple, List
@@ -27,8 +26,10 @@ from tensorflow import keras
 # Runtime configuration
 # -------------------------------------------------------------------
 
+# Disable XLA; keeps memory usage more predictable on WSL/consumer GPUs.
 tf.config.optimizer.set_jit(False)
 
+# Enable dynamic GPU memory growth.
 for g in tf.config.list_physical_devices("GPU"):
     try:
         tf.config.experimental.set_memory_growth(g, True)
@@ -59,6 +60,7 @@ def count_trainable_params(model: keras.Model) -> int:
 def build_lookup_tables(
     root: Path,
 ) -> Tuple[tf.lookup.StaticHashTable, tf.lookup.StaticHashTable, List[str]]:
+    """Builds WNID->index and val_filename->index lookups."""
     wnids_path = root / "wnids.txt"
     assert wnids_path.exists(), f"Missing: {wnids_path}"
     wnids = [w.strip() for w in wnids_path.read_text().splitlines() if w.strip()]
@@ -90,11 +92,8 @@ def build_lookup_tables(
 
 
 # -------------------------------------------------------------------
-# Augmentation primitives (pure TF)
+# Decode / resize
 # -------------------------------------------------------------------
-
-RAD_45 = math.pi / 4.0
-
 
 def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.Tensor:
     img = tf.image.decode_jpeg(img_bytes, channels=3)
@@ -103,92 +102,15 @@ def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.
     return img
 
 
-def rotate_image(img: tf.Tensor, radians: tf.Tensor) -> tf.Tensor:
-    img_shape = tf.shape(img)
-    h = tf.cast(img_shape[0], tf.float32)
-    w = tf.cast(img_shape[1], tf.float32)
-
-    cx = w / 2.0
-    cy = h / 2.0
-
-    cos_a = tf.math.cos(radians)
-    sin_a = tf.math.sin(radians)
-
-    tx = cx - cos_a * cx + sin_a * cy
-    ty = cy - sin_a * cx - cos_a * cy
-
-    transform = tf.stack(
-        [cos_a, -sin_a, tx,
-         sin_a,  cos_a, ty,
-         0.0,    0.0]
-    )
-    transform = tf.reshape(transform, (1, 8))
-
-    img_b = tf.expand_dims(img, 0)
-
-    out = tf.raw_ops.ImageProjectiveTransformV3(
-        images=img_b,
-        transforms=transform,
-        output_shape=tf.cast(tf.shape(img)[:2], tf.int32),
-        interpolation="BILINEAR",
-        fill_mode="REFLECT",
-        fill_value=0.0,
-    )
-
-    return tf.squeeze(out, 0)
-
-
-def blur_image(img: tf.Tensor) -> tf.Tensor:
-    kernel = tf.constant(
-        [[1, 2, 1],
-         [2, 4, 2],
-         [1, 2, 1]],
-        dtype=tf.float32,
-    )
-    kernel = kernel / tf.reduce_sum(kernel)
-    kernel = tf.reshape(kernel, [3, 3, 1, 1])
-
-    img_b = tf.expand_dims(img, 0)
-    img_blur = tf.nn.depthwise_conv2d(
-        img_b,
-        tf.tile(kernel, [1, 1, 3, 1]),
-        strides=[1, 1, 1, 1],
-        padding="SAME",
-    )
-    return img_blur[0]
-
-
-def random_augment(img: tf.Tensor) -> tf.Tensor:
-    # random horizontal flip
-    img = tf.cond(
-        tf.random.uniform(()) < 0.5,
-        lambda: tf.image.flip_left_right(img),
-        lambda: img,
-    )
-
-    # random rotation in [-45°, +45°]
-    angle = tf.random.uniform((), minval=-RAD_45, maxval=RAD_45)
-    img = rotate_image(img, angle)
-
-    # random blur with small probability
-    img = tf.cond(
-        tf.random.uniform(()) < 0.3,
-        lambda: blur_image(img),
-        lambda: img,
-    )
-
-    return img
-
-
 # -------------------------------------------------------------------
-# Dataset construction (with optional caching)
+# Dataset construction with Keras augmentations + optional cache
 # -------------------------------------------------------------------
 
 def make_datasets(
     root_dir: str,
     batch_size: int = 32,
     image_size: tuple[int, int] = (224, 224),
-    cache_to_disk: bool = False,
+    cache_to_disk: bool = True,
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset, int, List[str]]:
     root = Path(root_dir)
     train_dir = root / "train"
@@ -200,16 +122,28 @@ def make_datasets(
     wnid_to_index, valfile_to_index, wnids = build_lookup_tables(root)
     num_classes = len(wnids)
 
-    def _decode_train(path: tf.Tensor):
+    # Keras augmentation pipeline (cheap and running on GPU/CPU efficiently)
+    aug = keras.Sequential(
+        [
+            keras.layers.RandomFlip("horizontal"),
+            # 0.125 of 2π ≈ 45 degrees
+            keras.layers.RandomRotation(0.125, fill_mode="reflect"),
+            # zoom in up to ~30% (negative factors = zoom-in)
+            keras.layers.RandomZoom(
+                height_factor=(-0.3, 0.0),
+                width_factor=(-0.3, 0.0),
+                fill_mode="reflect",
+            ),
+        ],
+        name="augment",
+    )
+
+    def _load_train_raw(path: tf.Tensor):
         img_bytes = tf.io.read_file(path)
         img = _decode_and_resize(img_bytes, image_size)
         parts = tf.strings.split(path, os.sep)
         wnid = parts[-3]
         label = wnid_to_index.lookup(wnid)
-        return img, label
-
-    def _augment_train(img: tf.Tensor, label: tf.Tensor):
-        img = random_augment(img)
         return img, label
 
     def _load_val(path: tf.Tensor):
@@ -219,6 +153,7 @@ def make_datasets(
         label = valfile_to_index.lookup(fname)
         return img, label
 
+    # List files once
     train_files = tf.data.Dataset.list_files(
         str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True
     )
@@ -226,32 +161,33 @@ def make_datasets(
         str(val_img_dir / "*.JPEG"), shuffle=False
     )
 
-    # ---- TRAIN DATASET ----
-    train_ds = train_files.map(_decode_train, num_parallel_calls=AUTOTUNE)
+    # Decode + label for train (no aug yet)
+    train_raw = train_files.map(_load_train_raw, num_parallel_calls=AUTOTUNE)
 
+    # Optional on-disk cache of decoded images
     if cache_to_disk:
-        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-randaug"
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-aug"
         cache_root.mkdir(parents=True, exist_ok=True)
-        train_ds = train_ds.cache(str(cache_root / "train_decoded.cache"))
+        train_raw = train_raw.cache(str(cache_root / "train.cache"))
+        # We *fully* iterate the dataset in every epoch, so this is safe.
 
+    # Now add augmentation and batching
     train_ds = (
-        train_ds
+        train_raw
+        .map(lambda x, y: (aug(x, training=True), y), num_parallel_calls=AUTOTUNE)
         .shuffle(2000)
-        .map(_augment_train, num_parallel_calls=AUTOTUNE)
         .batch(batch_size, drop_remainder=True)
         .prefetch(AUTOTUNE)
     )
 
-    # ---- VAL DATASET (no augmentation) ----
-    val_ds = val_files.map(_load_val, num_parallel_calls=AUTOTUNE)
-
+    # Validation: no augmentation; optionally cache if you like (cheaper anyway)
+    val_raw = val_files.map(_load_val, num_parallel_calls=AUTOTUNE)
     if cache_to_disk:
-        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-randaug"
-        cache_root.mkdir(parents=True, exist_ok=True)
-        val_ds = val_ds.cache(str(cache_root / "val_decoded.cache"))
+        cache_root = Path.home() / ".tfdata_cache" / "tiny-imagenet-200-aug"
+        val_raw = val_raw.cache(str(cache_root / "val.cache"))
 
     val_ds = (
-        val_ds
+        val_raw
         .batch(batch_size, drop_remainder=False)
         .prefetch(AUTOTUNE)
     )
@@ -303,7 +239,7 @@ def print_mapping_summary(wnids: List[str], limit: int = 10) -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="MobileNetV2 on Tiny-ImageNet-200 with random handcrafted augmentations"
+        description="MobileNetV2 on Tiny-ImageNet-200 with Keras random augmentations"
     )
     ap.add_argument("--data_root", required=True, help="tiny-imagenet-200 root")
     ap.add_argument("--run_name", default="tinyimagenet_aug")
@@ -316,28 +252,26 @@ def main():
     ap.add_argument("--unfreeze_last", type=int, default=120)
     ap.add_argument("--lr_warmup", type=float, default=3e-4)
     ap.add_argument("--lr_finetune", type=float, default=1e-4)
-    ap.add_argument("--early_stop_patience", type=int, default=10)
+
+    # Caching control
+    ap.add_argument(
+        "--no_cache",
+        action="store_true",
+        help="Disable on-disk caching of decoded images",
+    )
 
     ap.add_argument(
         "--monitor",
         type=str,
         default="val_loss",
         choices=["val_loss", "val_accuracy"],
-        help="metric for LR schedule / early stopping / checkpointing",
+        help="metric for LR schedule / checkpointing",
     )
     ap.add_argument("--reduce_lr_patience", type=int, default=3)
     ap.add_argument("--reduce_lr_factor", type=float, default=0.5)
     ap.add_argument("--min_lr", type=float, default=1e-6)
 
-    # new flag: optional disk cache (after decode, before random aug)
-    ap.add_argument(
-        "--cache_to_disk",
-        action="store_true",
-        help="Cache decoded train/val images to disk before random augmentation.",
-    )
-
     args = ap.parse_args()
-
     image_size = tuple(args.image_size)
 
     run_dir = Path("runs") / args.run_name
@@ -349,14 +283,14 @@ def main():
         root_dir=args.data_root,
         batch_size=args.batch_size,
         image_size=image_size,
-        cache_to_disk=args.cache_to_disk,
+        cache_to_disk=not args.no_cache,
     )
 
     print_mapping_summary(wnids)
 
     model, base = build_model(num_classes)
 
-    # warm-up
+    # ---------------- Warm-up (head only) ----------------
     base.trainable = False
     model.compile(
         optimizer=keras.optimizers.Adam(args.lr_warmup),
@@ -380,7 +314,7 @@ def main():
         ],
     )
 
-    # fine-tuning
+    # ---------------- Fine-tuning ----------------
     unfreeze_tail(base, args.unfreeze_last)
     model.compile(
         optimizer=keras.optimizers.Adam(args.lr_finetune),
@@ -406,7 +340,6 @@ def main():
             verbose=1,
             mode=monitor_mode,
         ),
-        # EarlyStopping removed so it always runs full epochs_finetune
         keras.callbacks.CSVLogger(str(run_dir / "finetune_history.csv")),
     ]
 
