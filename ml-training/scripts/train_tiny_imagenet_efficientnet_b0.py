@@ -9,6 +9,8 @@ from typing import Tuple, List
 
 import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras.applications.efficientnet import preprocess_input # type: ignore
+
 
 # -------------------------------------------------------------------
 # Runtime configuration
@@ -81,10 +83,13 @@ def build_lookup_tables(
 # -------------------------------------------------------------------
 
 def _decode_and_resize(img_bytes: tf.Tensor, image_size: tuple[int, int]) -> tf.Tensor:
-    img = tf.image.decode_jpeg(img_bytes, channels=3)
+    img = tf.image.decode_jpeg(img_bytes, channels=3)              # uint8 0–255
     img = tf.image.resize(img, image_size, antialias=True)
-    img = tf.cast(img, tf.float32) / 255.0
+    img = tf.cast(img, tf.float32)
+    # IMPORTANT: EfficientNet-specific normalization
+    img = preprocess_input(img)                                    # expects 0–255 float
     return img
+
 
 
 def make_datasets(
