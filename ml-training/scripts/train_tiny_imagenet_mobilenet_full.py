@@ -110,9 +110,6 @@ def make_datasets(
     train_files = tf.data.Dataset.list_files(str(train_dir / "*" / "images" / "*.JPEG"), shuffle=True)
     val_files = tf.data.Dataset.list_files(str(val_img_dir / "*.JPEG"), shuffle=False)
 
-    # --- NO AUGMENTATIONS VERSION ---
-    # Just decode + resize + batch + prefetch
-
     def _map_train(path: tf.Tensor):
         img, label = _load_train(path)
         return img, label
@@ -223,6 +220,13 @@ def main():
 
     cache_to_disk = False if args.no_cache else args.cache_to_disk
 
+    # ✅ Create run directory *before* CSVLogger is used
+    out_dir = Path("runs") / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_dir = out_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     train_ds, val_ds, num_classes, wnids = make_datasets(
         root_dir=args.data_root,
         batch_size=args.batch_size,
@@ -255,7 +259,7 @@ def main():
         validation_steps=val_steps,
         verbose=2,
         callbacks=[
-            keras.callbacks.CSVLogger(f"runs/{args.run_name}/warmup_history.csv", append=False)
+            keras.callbacks.CSVLogger(str(out_dir / "warmup_history.csv"), append=False),
         ],
     )
 
@@ -267,12 +271,6 @@ def main():
         loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
     )
-
-    out_dir = Path("runs") / args.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    ckpt_dir = out_dir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     callbacks = [
         keras.callbacks.ModelCheckpoint(
