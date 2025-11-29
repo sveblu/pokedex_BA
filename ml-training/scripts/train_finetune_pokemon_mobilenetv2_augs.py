@@ -68,15 +68,18 @@ def build_ds(root, img_size=(224, 224), batch=32):
     num_classes = len(class_names)
 
     aug = keras.Sequential(
-        [
-            keras.layers.RandomFlip("horizontal"),
-            keras.layers.RandomRotation(0.08),
-            keras.layers.RandomZoom(0.15),
-            keras.layers.RandomTranslation(0.05, 0.05),
-            keras.layers.RandomContrast(0.1),
-        ],
+    [
+        keras.layers.RandomFlip("horizontal"),
+        keras.layers.RandomRotation(0.125, fill_mode="reflect"),  # ≈ ±45°
+        keras.layers.RandomZoom(
+            height_factor=(-0.3, 0.0),   # zoom-in only, up to ~30%
+            width_factor=(-0.3, 0.0),
+            fill_mode="reflect",
+        ),
+    ],
         name="aug",
-    )
+)
+
 
     def norm(x, y):
         x = tf.cast(x, tf.float32) / 255.0
