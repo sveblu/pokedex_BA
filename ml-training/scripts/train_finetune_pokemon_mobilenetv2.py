@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # hide INFO & WARNING, show only ERROR
 
 import argparse
 import json
@@ -14,6 +14,10 @@ from tensorflow import keras
 
 AUTOTUNE = tf.data.AUTOTUNE
 
+
+# -------------------------------------------------------------------
+# Small helpers
+# -------------------------------------------------------------------
 
 def non_empty_subdirs(p: Path):
     out = []
@@ -63,9 +67,10 @@ def build_ds(root, img_size=(224, 224), batch=32):
     class_names = tr_raw.class_names
     num_classes = len(class_names)
 
-    # No augmentations here, just rescaling to [0,1]
+    # --- NO AUGMENTATIONS: just rescale to [0,1] ---
     def norm(x, y):
-        return tf.cast(x, tf.float32) / 255.0, y
+        x = tf.cast(x, tf.float32) / 255.0
+        return x, y
 
     tr = tr_raw.map(norm, num_parallel_calls=AUTOTUNE).prefetch(2)
     va = va_raw.map(norm, num_parallel_calls=AUTOTUNE).prefetch(2)
@@ -81,7 +86,8 @@ def freeze_bn(model):
 
 def unfreeze_tail(model, n_layers):
     unfrozen = 0
-    for l in reversed(model.layers[:-1]):  # skip new head
+    # skip last layer (new head)
+    for l in reversed(model.layers[:-1]):
         if unfrozen >= n_layers:
             break
         if not isinstance(l, keras.layers.BatchNormalization):
@@ -89,19 +95,36 @@ def unfreeze_tail(model, n_layers):
         unfrozen += 1
 
 
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Finetune MobileNetV2 on Pokémon data (no augmentations)"
+        description="Finetune Tiny-ImageNet-pretrained model on Pokémon dataset (no augmentations)"
     )
     ap.add_argument("--pokemon_root", required=True,
-                    help="root with train/ and val/ subdirs")
+                    help="Root with train/ and val/ Pokémon folders")
     ap.add_argument(
-        "--base_model",
+        "--pretrain_run",
         required=True,
-        help="path to pre-trained Tiny-ImageNet .keras (e.g. runs/.../best.keras)",
+        help="Name of Tiny-ImageNet run under runs/ (e.g. tinyimagenet_mobilenetv2_v1_acc)",
     )
-    ap.add_argument("--run_name", default="pokemon_mobilenetv2_noaugs")
+    ap.add_argument(
+        "--pretrain_ckpt",
+        default="best.keras",
+        help="Checkpoint filename inside runs/<pretrain_run>/checkpoints/ (default: best.keras)",
+    )
+    ap.add_argument(
+        "--run_name",
+        required=True,
+        help="Output run name under runs/ for this Pokémon finetune",
+    )
+
     ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--image_size", type=int, nargs=2, default=(224, 224),
+                    help="Image size (H W), e.g. 224 224 or 240 240 or 260 260")
+
     ap.add_argument("--epochs_warmup", type=int, default=5)
     ap.add_argument("--epochs_finetune", type=int, default=30)
     ap.add_argument("--unfreeze_last", type=int, default=60)
@@ -110,26 +133,57 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=3e-4)
     ap.add_argument("--early_stop_patience", type=int, default=6)
     ap.add_argument("--tensorboard", action="store_true")
+
     args = ap.parse_args()
+
+    img_size = tuple(args.image_size)
+
+    # ------------------------------------------------------------------
+    # Paths: pretrain checkpoint + Pokémon run output
+    # ------------------------------------------------------------------
+    pretrain_dir = Path("runs") / args.pretrain_run / "checkpoints"
+    base_model_path = pretrain_dir / args.pretrain_ckpt
+    if not base_model_path.is_file():
+        raise FileNotFoundError(
+            f"Could not find base model: {base_model_path} "
+            f"(check --pretrain_run / --pretrain_ckpt)."
+        )
 
     out = Path("runs") / args.run_name
     ckpt = out / "checkpoints"
     out.mkdir(parents=True, exist_ok=True)
     ckpt.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
     train_ds, val_ds, num_classes, class_names = build_ds(
-        args.pokemon_root, batch=args.batch_size
+        args.pokemon_root,
+        img_size=img_size,
+        batch=args.batch_size,
     )
 
-    old = keras.models.load_model(args.base_model)
+    # ------------------------------------------------------------------
+    # Load base model and replace head
+    # ------------------------------------------------------------------
+    old = keras.models.load_model(base_model_path)
     features = old.layers[-1].input  # tensor before old Dense(200)
-    logits = keras.layers.Dense(
-        num_classes, activation="softmax", name="pokemon_head"
-    )(features)
-    model = keras.Model(inputs=old.input, outputs=logits,
-                        name="mobilenetv2_pokemon_noaugs")
 
-    # ---------------- warm-up head ----------------
+    logits = keras.layers.Dense(
+        num_classes,
+        activation="softmax",
+        name="pokemon_head",
+    )(features)
+
+    model = keras.Model(
+        inputs=old.input,
+        outputs=logits,
+        name=f"{old.name}_pokemon",
+    )
+
+    # ------------------------------------------------------------------
+    # Warm-up head
+    # ------------------------------------------------------------------
     for l in model.layers:
         l.trainable = False
     model.layers[-1].trainable = True
@@ -156,7 +210,9 @@ def main():
         verbose=2,
     )
 
-    # ---------------- fine-tune tail ----------------
+    # ------------------------------------------------------------------
+    # Fine-tune tail
+    # ------------------------------------------------------------------
     for l in model.layers:
         l.trainable = False
     freeze_bn(model)
@@ -208,15 +264,18 @@ def main():
         verbose=2,
     )
 
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
     model.save(ckpt / "final.keras")
     (out / "classes.json").write_text(json.dumps(class_names, indent=2))
 
     print(
         f"\nSaved:\n"
-        f"  - {ckpt/'best_by_acc.keras'}\n"
-        f"  - {ckpt/'best_by_loss.keras'}\n"
-        f"  - {ckpt/'final.keras'}\n"
-        f"  - {out/'classes.json'}"
+        f"  - {ckpt / 'best_by_acc.keras'}\n"
+        f"  - {ckpt / 'best_by_loss.keras'}\n"
+        f"  - {ckpt / 'final.keras'}\n"
+        f"  - {out / 'classes.json'}\n"
     )
 
 
