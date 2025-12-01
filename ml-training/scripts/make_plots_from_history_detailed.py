@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Make detailed training curves + confusion matrix for a finetuned run.
+Make detailed training curves + confusion matrix for ALL runs in runs/
+whose folder name ends with 'acc'.
 
 Usage:
-  python scripts/make_plots_from_history_detailed.py \
-      --run_dir runs/pokemon_v2 \
-      --val_root data/pokemon/val
+  python scripts/make_plots_from_history_detailed.py --val_root data/pokemon/val
 """
 
 import argparse
@@ -28,10 +27,6 @@ AUTOTUNE = tf.data.AUTOTUNE
 # ------------------------------------------------------------
 
 def load_history(run_dir: Path) -> pd.DataFrame:
-    """
-    Load warmup_history.csv and finetune_history.csv and stitch them
-    into a single DataFrame with a global epoch index starting at 1.
-    """
     warm_path = run_dir / "warmup_history.csv"
     fine_path = run_dir / "finetune_history.csv"
 
@@ -42,7 +37,6 @@ def load_history(run_dir: Path) -> pd.DataFrame:
 
     if warm_path.exists() and warm_path.stat().st_size > 0:
         df_warm = pd.read_csv(warm_path)
-        # Keras CSVLogger stores an 'epoch' column starting at 0
         df_warm["epoch_global"] = df_warm["epoch"] + 1
         offset = int(df_warm["epoch_global"].max())
         df_fine["epoch_global"] = df_fine["epoch"] + 1 + offset
@@ -55,16 +49,10 @@ def load_history(run_dir: Path) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# Training curves with detailed annotations
+# Training curves plotting
 # ------------------------------------------------------------
 
 def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
-    """
-    Plot accuracy & loss curves, annotate:
-      - best val accuracy + epoch
-      - best val loss + epoch
-      - train/val accuracy numeric values every 5th epoch
-    """
     sns.set_style("whitegrid")
 
     epochs = history["epoch_global"].to_numpy()
@@ -86,7 +74,7 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
         1, 2, figsize=(14, 5), dpi=150, constrained_layout=True
     )
 
-    # ---------- Accuracy ----------
+    # --- Accuracy ---
     ax_acc.plot(epochs, acc, label="train acc", color="C0")
     ax_acc.plot(epochs, val_acc, label="val acc", color="C1")
     ax_acc.set_title("Accuracy over epochs")
@@ -95,7 +83,6 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
     ax_acc.set_ylim(0.0, 1.05)
     ax_acc.legend(loc="lower right")
 
-    # annotate best val accuracy
     ax_acc.annotate(
         f"Best val acc\n(ep {best_acc_epoch}: {best_acc:.3f})",
         xy=(best_acc_epoch, best_acc),
@@ -106,30 +93,14 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
         va="top",
     )
 
-    # annotate every 5th epoch with numeric train/val acc
     for e, a_tr, a_val in zip(epochs, acc, val_acc):
         if e % 5 == 0:
-            ax_acc.text(
-                e,
-                a_tr + 0.02,
-                f"{a_tr:.2f}",
-                color="C0",
-                fontsize=7,
-                ha="center",
-            )
-            ax_acc.text(
-                e,
-                a_val - 0.04,
-                f"{a_val:.2f}",
-                color="C1",
-                fontsize=7,
-                ha="center",
-            )
+            ax_acc.text(e, a_tr + 0.02, f"{a_tr:.2f}", color="C0", fontsize=7, ha="center")
+            ax_acc.text(e, a_val - 0.04, f"{a_val:.2f}", color="C1", fontsize=7, ha="center")
 
-    # vertical line at best epoch
     ax_acc.axvline(best_acc_epoch, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
 
-    # ---------- Loss ----------
+    # --- Loss ---
     ax_loss.plot(epochs, loss, label="train loss", color="C0")
     ax_loss.plot(epochs, val_loss, label="val loss", color="C1")
     ax_loss.set_title("Loss over epochs")
@@ -147,7 +118,6 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
         va="bottom",
     )
 
-    # optional LR on a twin axis (light line)
     if not np.all(np.isnan(lr)):
         ax_lr = ax_loss.twinx()
         ax_lr.plot(epochs, lr, color="C2", alpha=0.4, label="lr")
@@ -167,7 +137,7 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
 # ------------------------------------------------------------
 
 def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> None:
-    print("→ Loading model…")
+    print(f"→ Loading model: {model_path}")
     model = keras.models.load_model(model_path)
 
     print("→ Loading val dataset…")
@@ -185,19 +155,17 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
         num_parallel_calls=AUTOTUNE,
     ).prefetch(2)
 
-    y_true = []
-    y_pred = []
+    y_true, y_pred = [], []
     for xb, yb in val_ds:
         probs = model.predict(xb, verbose=0)
         y_true.append(yb.numpy())
         y_pred.append(np.argmax(probs, axis=-1))
 
-    y_true = np.concatenate(y_true, axis=0)
-    y_pred = np.concatenate(y_pred, axis=0)
+    y_true = np.concatenate(y_true)
+    y_pred = np.concatenate(y_pred)
 
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
-    cm = cm.astype("float")
-    cm /= cm.sum(axis=1, keepdims=True) + 1e-12  # normalize rows
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes))).astype(float)
+    cm /= cm.sum(axis=1, keepdims=True) + 1e-12
 
     plt.figure(figsize=(10, 8), dpi=150)
     sns.heatmap(
@@ -219,26 +187,39 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
 
 
 # ------------------------------------------------------------
-# Main
+# Main: LOOP OVER ALL runs/*acc
 # ------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run_dir", required=True, help="Path to run folder (with CSVs)")
     parser.add_argument("--val_root", required=True, help="Path to val/ directory")
     args = parser.parse_args()
 
-    run = Path(args.run_dir)
-    val_root = Path(args.val_root)
+    runs_root = Path("runs")
+    acc_runs = sorted([d for d in runs_root.iterdir() if d.is_dir() and d.name.endswith("acc")])
 
-    history = load_history(run)
-    plot_training_curves(history, run / "training_curves_detailed.png")
+    if not acc_runs:
+        print("⚠ No run directories ending with 'acc' found in runs/")
+        return
 
-    model_path = run / "checkpoints" / "best_by_acc.keras"
-    if model_path.exists():
-        plot_confusion_matrix(model_path, val_root, run / "confusion_matrix_detailed.png")
-    else:
-        print(f"⚠ best_by_acc model not found at {model_path}, skipping confusion matrix.")
+    print(f"Found {len(acc_runs)} runs ending with 'acc'.")
+
+    for run in acc_runs:
+        print("\n==============================")
+        print(f"Processing run: {run.name}")
+        print("==============================")
+
+        try:
+            history = load_history(run)
+            plot_training_curves(history, run / "training_curves_detailed.png")
+
+            model_path = run / "checkpoints" / "best_by_acc.keras"
+            if model_path.exists():
+                plot_confusion_matrix(model_path, Path(args.val_root), run / "confusion_matrix_detailed.png")
+            else:
+                print(f"⚠ No best_by_acc.keras found in {run}/checkpoints/, skipping confusion matrix.")
+        except Exception as e:
+            print(f"❌ Error processing {run.name}: {e}")
 
 
 if __name__ == "__main__":
