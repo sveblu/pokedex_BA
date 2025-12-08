@@ -20,6 +20,7 @@ import seaborn as sns
 import tensorflow as tf
 from tensorflow import keras
 from sklearn.metrics import confusion_matrix
+from tensorflow.keras.applications.efficientnet import preprocess_input as effnet_preprocess
 
 AUTOTUNE = tf.data.AUTOTUNE
 
@@ -182,10 +183,23 @@ def plot_confusion_matrix(run_dir: Path, model_path: Path, val_root: Path, out_p
     )
 
     # Same normalization as in Pokémon finetune scripts (x / 255.0)
+       # pick normalization depending on model type
+    model_path_str = str(model_path).lower()
+    if "efficientnet" in model_path_str:
+        print("→ Using EfficientNet preprocess_input for normalization")
+        def norm(x):
+            x = tf.cast(x, tf.float32)  # 0–255
+            return effnet_preprocess(x)
+    else:
+        print("→ Using x/255 normalization")
+        def norm(x):
+            return tf.cast(x, tf.float32) / 255.0
+
     val_ds = val_ds.map(
-        lambda x, y: (tf.cast(x, tf.float32) / 255.0, y),
+        lambda x, y: (norm(x), y),
         num_parallel_calls=AUTOTUNE,
     ).prefetch(2)
+
 
     y_true, y_pred = [], []
     for xb, yb in val_ds:
