@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Make detailed training curves + confusion matrix for ALL runs in runs/
-whose folder name ends with 'acc'.
+Make detailed training curves + confusion matrix for ONE run.
 
 Usage:
-  python scripts/make_plots_from_history_detailed.py --val_root data/pokemon/val
+  python scripts/make_plots_from_history_detailed.py \
+      --run_dir runs/pokemon_efficientnet_b2_aug_v1_acc \
+      --val_root data/pokemon/val \
+      --image_size 224 224
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -133,19 +136,35 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
 
 
 # ------------------------------------------------------------
-# Confusion matrix
+# Confusion matrix (uses classes.json to align class order)
 # ------------------------------------------------------------
 
-def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> None:
+def plot_confusion_matrix(
+    model_path: Path,
+    val_root: Path,
+    out_path: Path,
+    image_size=(224, 224),
+    classes_json: Path | None = None,
+) -> None:
     print(f"→ Loading model: {model_path}")
     model = keras.models.load_model(model_path)
+
+    # Load class order from finetune run if available
+    class_names_arg = None
+    if classes_json is not None and classes_json.exists():
+        with classes_json.open() as f:
+            class_names_arg = json.load(f)
+        print(f"→ Using class order from {classes_json}")
+    else:
+        print("→ No classes.json found, using alphabetical class order from val_root")
 
     print("→ Loading val dataset…")
     val_ds = tf.keras.utils.image_dataset_from_directory(
         val_root,
-        image_size=(224, 224),
+        image_size=image_size,
         batch_size=64,
         shuffle=False,
+        class_names=class_names_arg,
     )
     class_names = val_ds.class_names
     num_classes = len(class_names)
@@ -164,7 +183,9 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
     y_true = np.concatenate(y_true)
     y_pred = np.concatenate(y_pred)
 
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes))).astype(float)
+    cm = confusion_matrix(
+        y_true, y_pred, labels=list(range(num_classes))
+    ).astype(float)
     cm /= cm.sum(axis=1, keepdims=True) + 1e-12
 
     plt.figure(figsize=(10, 8), dpi=150)
@@ -187,39 +208,44 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
 
 
 # ------------------------------------------------------------
-# Main: LOOP OVER ALL runs/*acc
+# Main
 # ------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--run_dir", required=True, help="Path to single run folder")
     parser.add_argument("--val_root", required=True, help="Path to val/ directory")
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        default=(224, 224),
+        help="Image size H W (default: 224 224)",
+    )
     args = parser.parse_args()
 
-    runs_root = Path("runs")
-    acc_runs = sorted([d for d in runs_root.iterdir() if d.is_dir() and d.name.endswith("acc")])
+    run = Path(args.run_dir)
+    val_root = Path(args.val_root)
+    image_size = tuple(args.image_size)
 
-    if not acc_runs:
-        print("⚠ No run directories ending with 'acc' found in runs/")
+    # history + curves
+    history = load_history(run)
+    plot_training_curves(history, run / "training_curves_detailed.png")
+
+    # model for confusion matrix
+    model_path = run / "checkpoints" / "best_by_acc.keras"
+    if not model_path.exists():
+        print(f"⚠ best_by_acc model not found at {model_path}, skipping confusion matrix.")
         return
 
-    print(f"Found {len(acc_runs)} runs ending with 'acc'.")
-
-    for run in acc_runs:
-        print("\n==============================")
-        print(f"Processing run: {run.name}")
-        print("==============================")
-
-        try:
-            history = load_history(run)
-            plot_training_curves(history, run / "training_curves_detailed.png")
-
-            model_path = run / "checkpoints" / "best_by_acc.keras"
-            if model_path.exists():
-                plot_confusion_matrix(model_path, Path(args.val_root), run / "confusion_matrix_detailed.png")
-            else:
-                print(f"⚠ No best_by_acc.keras found in {run}/checkpoints/, skipping confusion matrix.")
-        except Exception as e:
-            print(f"❌ Error processing {run.name}: {e}")
+    classes_json = run / "classes.json"
+    plot_confusion_matrix(
+        model_path,
+        val_root,
+        run / "confusion_matrix_detailed.png",
+        image_size=image_size,
+        classes_json=classes_json,
+    )
 
 
 if __name__ == "__main__":
