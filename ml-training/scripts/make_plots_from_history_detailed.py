@@ -4,11 +4,12 @@ Make detailed training curves + confusion matrix for ONE finetuned run.
 
 Usage:
   python scripts/make_plots_from_history_detailed.py \
-      --run_dir runs/pokemon_mobilenetv2_aug_v1_acc \
+      --run_dir runs/pokemon_efficientnet_b1_noaug_v1_acc \
       --val_root data/pokemon/val
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,6 @@ AUTOTUNE = tf.data.AUTOTUNE
 # ------------------------------------------------------------
 
 def load_history(run_dir: Path) -> pd.DataFrame:
-    """Load warmup_history.csv + finetune_history.csv into one DataFrame."""
     warm_path = run_dir / "warmup_history.csv"
     fine_path = run_dir / "finetune_history.csv"
 
@@ -51,7 +51,7 @@ def load_history(run_dir: Path) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# Training curves with detailed annotations
+# Training curves
 # ------------------------------------------------------------
 
 def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
@@ -76,7 +76,7 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
         1, 2, figsize=(14, 5), dpi=150, constrained_layout=True
     )
 
-    # ---------- Accuracy ----------
+    # ----- Accuracy -----
     ax_acc.plot(epochs, acc, label="train acc", color="C0")
     ax_acc.plot(epochs, val_acc, label="val acc", color="C1")
     ax_acc.set_title("Accuracy over epochs")
@@ -97,32 +97,12 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
 
     for e, a_tr, a_val in zip(epochs, acc, val_acc):
         if e % 5 == 0:
-            ax_acc.text(
-                e,
-                a_tr + 0.02,
-                f"{a_tr:.2f}",
-                color="C0",
-                fontsize=7,
-                ha="center",
-            )
-            ax_acc.text(
-                e,
-                a_val - 0.04,
-                f"{a_val:.2f}",
-                color="C1",
-                fontsize=7,
-                ha="center",
-            )
+            ax_acc.text(e, a_tr + 0.02, f"{a_tr:.2f}", color="C0", fontsize=7, ha="center")
+            ax_acc.text(e, a_val - 0.04, f"{a_val:.2f}", color="C1", fontsize=7, ha="center")
 
-    ax_acc.axvline(
-        best_acc_epoch,
-        color="gray",
-        linestyle="--",
-        linewidth=0.8,
-        alpha=0.6,
-    )
+    ax_acc.axvline(best_acc_epoch, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
 
-    # ---------- Loss ----------
+    # ----- Loss -----
     ax_loss.plot(epochs, loss, label="train loss", color="C0")
     ax_loss.plot(epochs, val_loss, label="val loss", color="C1")
     ax_loss.set_title("Loss over epochs")
@@ -140,7 +120,6 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
         va="bottom",
     )
 
-    # optional LR on twin axis
     if not np.all(np.isnan(lr)):
         ax_lr = ax_loss.twinx()
         ax_lr.plot(epochs, lr, color="C2", alpha=0.4, label="lr")
@@ -160,11 +139,8 @@ def plot_training_curves(history: pd.DataFrame, out_path: Path) -> None:
 # ------------------------------------------------------------
 
 def infer_image_size_from_model(model: keras.Model) -> tuple[int, int]:
-    """Infer H,W from model input shape."""
-    # model.input_shape is usually (None, H, W, C)
     ishape = getattr(model, "input_shape", None)
     if ishape is None:
-        # fall back to first layer input
         ishape = getattr(model.layers[0], "input_shape", None)
 
     if ishape is None or len(ishape) < 3:
@@ -179,12 +155,22 @@ def infer_image_size_from_model(model: keras.Model) -> tuple[int, int]:
     return (int(h), int(w))
 
 
-def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> None:
+def plot_confusion_matrix(run_dir: Path, model_path: Path, val_root: Path, out_path: Path) -> None:
     print(f"→ Loading model: {model_path}")
     model = keras.models.load_model(model_path)
 
     img_size = infer_image_size_from_model(model)
     print(f"→ Using image size {img_size} for evaluation")
+
+    # Load the exact class order used during finetuning
+    classes_file = run_dir / "classes.json"
+    if classes_file.exists():
+        class_names = json.loads(classes_file.read_text())
+        print(f"→ Loaded {len(class_names)} classes from {classes_file}")
+    else:
+        raise FileNotFoundError(
+            f"{classes_file} not found – cannot guarantee label order matches training."
+        )
 
     print("→ Loading val dataset…")
     val_ds = tf.keras.utils.image_dataset_from_directory(
@@ -192,11 +178,10 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
         image_size=img_size,
         batch_size=64,
         shuffle=False,
+        class_names=class_names,   # enforce same order as training
     )
-    class_names = val_ds.class_names
-    num_classes = len(class_names)
 
-    # Same normalization as in Pokémon finetune scripts: x / 255
+    # Same normalization as in Pokémon finetune scripts (x / 255.0)
     val_ds = val_ds.map(
         lambda x, y: (tf.cast(x, tf.float32) / 255.0, y),
         num_parallel_calls=AUTOTUNE,
@@ -211,16 +196,15 @@ def plot_confusion_matrix(model_path: Path, val_root: Path, out_path: Path) -> N
     y_true = np.concatenate(y_true)
     y_pred = np.concatenate(y_pred)
 
-    # Print sanity-check accuracy vs CSV val_accuracy
     overall_acc = (y_true == y_pred).mean()
     print(f"→ Overall val accuracy from confusion matrix: {overall_acc:.4f}")
 
     cm = confusion_matrix(
         y_true,
         y_pred,
-        labels=list(range(num_classes)),
+        labels=list(range(len(class_names))),
     ).astype(float)
-    cm /= cm.sum(axis=1, keepdims=True) + 1e-12  # normalize rows
+    cm /= cm.sum(axis=1, keepdims=True) + 1e-12
 
     plt.figure(figsize=(10, 8), dpi=150)
     sns.heatmap(
@@ -259,7 +243,7 @@ def main():
 
     model_path = run / "checkpoints" / "best_by_acc.keras"
     if model_path.exists():
-        plot_confusion_matrix(model_path, val_root, run / "confusion_matrix_detailed.png")
+        plot_confusion_matrix(run, model_path, val_root, run / "confusion_matrix_detailed.png")
     else:
         print(f"⚠ best_by_acc model not found at {model_path}, skipping confusion matrix.")
 
